@@ -70,6 +70,9 @@ trait MeLexer {
     fn apply_line_offset(&self, line: u32, location: Location) -> Step<u32>;
 }
 
+/// Tokens one fully expanded macro argument may hold; nested arguments otherwise grow without bound.
+const MAX_EXPANDED_ARGUMENT_TOKENS: usize = 1 << 20;
+
 fn make_unexpected_error(token: LexerToken) -> StepExit {
     let error = match token.value {
         LexerTokenValue::Integer(i) => PreprocessorError::UnexpectedToken(TokenValue::Integer(i)),
@@ -368,6 +371,12 @@ impl MacroProcessor {
                         }
                     }
 
+                    if expanded_parameters.len() >= MAX_EXPANDED_ARGUMENT_TOKENS {
+                        return Err(StepExit::Error((
+                            PreprocessorError::RecursionLimitReached,
+                            token.location,
+                        )));
+                    }
                     expanded_parameters.push(token);
                 }
             }

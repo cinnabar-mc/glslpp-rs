@@ -1633,3 +1633,13 @@ fn generated_lines_keep_original_line_macros_and_explicit_offsets() {
         .collect();
     assert_eq!(values, [12, 34, 81]);
 }
+
+#[test]
+fn nested_macro_arguments_stop_at_the_expansion_limit() {
+    let mut input = String::from("#define D(x) x x\n");
+    input += &"D(".repeat(24);
+    input += "a";
+    input += &")".repeat(24);
+    let mut pp = Preprocessor::new(&input);
+    assert!(pp.any(|item| matches!(item, Err((PreprocessorError::RecursionLimitReached, _)))));
+}
