@@ -1436,7 +1436,7 @@ fn float_conditions_are_opt_in_and_use_expanded_macro_state() {
         #endif
         ENV";
     let mut pp = Preprocessor::new(input);
-    pp.set_allow_float_conditions(true);
+    pp.set_iris_conditions(true);
     pp.add_define("ENV", "2.5").unwrap();
     let values: Vec<_> = pp.map(|item| item.unwrap().value).collect();
     let integers: Vec<_> = values
@@ -1454,6 +1454,77 @@ fn float_conditions_are_opt_in_and_use_expanded_macro_state() {
 #[test]
 fn float_conditions_do_not_relax_line_directives() {
     let mut pp = Preprocessor::new("#line 1.5\n10");
-    pp.set_allow_float_conditions(true);
+    pp.set_iris_conditions(true);
     assert!(pp.any(|item| item.is_err()));
+}
+
+#[test]
+fn condition_nesting_returns_an_error_in_both_modes() {
+    for iris in [false, true].iter().copied() {
+        for expression in [
+            format!("{}1{}", "(".repeat(10_000), ")".repeat(10_000)),
+            format!("{}1", "!".repeat(10_000)),
+        ]
+        .iter()
+        {
+            let source = format!("#if {}\n1\n#endif", expression);
+            let mut pp = Preprocessor::new(&source);
+            pp.set_iris_conditions(iris);
+            assert!(
+                pp.any(|item| matches!(item, Err((PreprocessorError::RecursionLimitReached, _))))
+            );
+        }
+        let source = format!("#if {}1{}\n1\n#endif", "(".repeat(32), ")".repeat(32));
+        let mut pp = Preprocessor::new(&source);
+        pp.set_iris_conditions(iris);
+        assert!(pp.all(|item| item.is_ok()));
+    }
+    let source = format!("#if {}1\n1\n#endif", "0 ? 1 : ".repeat(10_000));
+    let mut pp = Preprocessor::new(&source);
+    pp.set_iris_conditions(true);
+    assert!(pp.any(|item| matches!(item, Err((PreprocessorError::RecursionLimitReached, _)))));
+}
+
+#[test]
+fn iris_ternaries_have_conditional_precedence_and_associativity() {
+    for (condition, expected) in [
+        ("MC_VERSION >= 12100 ? 1 : 0", 1),
+        ("0 ? 2 : 0 ? 3 : 4", 4),
+        ("1 ? 0 ? 3 : 4 : 5", 4),
+        ("1 || 0 ? 7 : 9", 7),
+        ("0 ? 2 : 1.5", 1),
+    ]
+    .iter()
+    .copied()
+    {
+        let source = format!("#if ({}) == {}\n7\n#else\n9\n#endif", condition, expected);
+        let mut pp = Preprocessor::new(&source);
+        pp.set_iris_conditions(true);
+        pp.add_define("MC_VERSION", "12111").unwrap();
+        let values: Vec<_> = pp.map(|item| item.unwrap().value).collect();
+        assert!(
+            matches!(values.as_slice(), [TokenValue::Integer(value)] if value.value == 7),
+            "{:?}",
+            values
+        );
+    }
+    let mut pp = Preprocessor::new("#if 0\n9\n#elif 1 ? 1 : 0\n7\n#endif");
+    pp.set_iris_conditions(true);
+    let values: Vec<_> = pp.map(|item| item.unwrap().value).collect();
+    assert!(matches!(values.as_slice(), [TokenValue::Integer(value)] if value.value == 7));
+    assert!(Preprocessor::new("#if 1 ? 1 : 0\n7\n#endif").any(|item| item.is_err()));
+    for condition in ["1 ? 2", "1 ? : 3", "1 ? 2 3", "1 ? 2 :"].iter() {
+        let source = format!("#if {}\n7\n#endif", condition);
+        let mut pp = Preprocessor::new(&source);
+        pp.set_iris_conditions(true);
+        assert!(pp.any(|item| item.is_err()));
+    }
+}
+
+#[test]
+fn condition_negation_overflow_returns_an_error() {
+    check_preprocessing_error(
+        "#if -(-9223372036854775807 - 1)\n1\n#endif",
+        PreprocessorError::IntegerOverflow,
+    );
 }

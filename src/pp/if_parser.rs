@@ -3,6 +3,9 @@ use crate::token::{Integer, PreprocessorError, Punct};
 use super::{Define, Location, MacroProcessor, MeLexer, Step, StepExit, Token, TokenValue};
 use std::{collections::HashMap, convert::TryInto, rc::Rc, vec};
 
+/// Maximum recursive expression nesting before returning an error.
+const MAX_EXPRESSION_DEPTH: usize = 64;
+
 struct IfLexer<'macros> {
     tokens: vec::IntoIter<Token>,
     defines: &'macros HashMap<String, Rc<Define>>,
@@ -14,21 +17,22 @@ pub(super) struct IfParser<'macros> {
     location: Location,
 
     parsing_if: bool,
-    allow_float_conditions: bool,
+    iris_conditions: bool,
     carry: Option<Token>,
+    expression_depth: usize,
 }
 
 impl<'macros> IfParser<'macros> {
     /// Builds a new IfParser that can be reused
     ///
     /// `parsing_if` indicates wether or not non defined macros should be
-    /// replaced with 0. `allow_float_conditions` truncates expanded float atoms to integers.
+    /// replaced with 0. `iris_conditions` enables float truncation and ternaries.
     pub fn new(
         tokens: Vec<Token>,
         defines: &'macros HashMap<String, Rc<Define>>,
         location: Location,
         parsing_if: bool,
-        allow_float_conditions: bool,
+        iris_conditions: bool,
     ) -> Self {
         IfParser {
             lexer: IfLexer {
@@ -39,8 +43,9 @@ impl<'macros> IfParser<'macros> {
             location,
 
             parsing_if,
-            allow_float_conditions,
+            iris_conditions,
             carry: None,
+            expression_depth: 0,
         }
     }
 
@@ -172,9 +177,9 @@ impl<'macros> IfParser<'macros> {
                 self.handle_defined()
             }
             TokenValue::Integer(int) => Ok(int.value as i64),
-            TokenValue::Float(float) if self.allow_float_conditions => Ok(float.value as i64),
+            TokenValue::Float(float) if self.iris_conditions => Ok(float.value as i64),
             TokenValue::Punct(Punct::LeftParen) => {
-                let val = self.parse_logical_or()?;
+                let val = self.nested(Self::parse_conditional)?;
 
                 let close_brace = self.expect_next()?;
 
@@ -199,11 +204,14 @@ impl<'macros> IfParser<'macros> {
                 Punct::Plus | Punct::Minus | Punct::Bang | Punct::Tilde => {
                     self.next()?;
 
-                    let val = self.parse_unary()?;
+                    let val = self.nested(Self::parse_unary)?;
 
                     Ok(match punct {
                         Punct::Plus => val,
-                        Punct::Minus => -val,
+                        Punct::Minus => val.checked_neg().ok_or(StepExit::Error((
+                            PreprocessorError::IntegerOverflow,
+                            self.location,
+                        )))?,
                         Punct::Bang => (val == 0) as i64,
                         Punct::Tilde => !val,
                         _ => unreachable!(),
@@ -441,8 +449,51 @@ impl<'macros> IfParser<'macros> {
         Ok(left)
     }
 
+    /// Parses one nested expression without exceeding the stack-depth budget.
+    fn nested(&mut self, parse: fn(&mut Self) -> Step<i64>) -> Step<i64> {
+        if self.expression_depth >= MAX_EXPRESSION_DEPTH {
+            return Err(StepExit::Error((
+                PreprocessorError::RecursionLimitReached,
+                self.location,
+            )));
+        }
+        self.expression_depth += 1;
+        let result = parse(self);
+        self.expression_depth -= 1;
+        result
+    }
+
+    /// Parses the low-precedence, right-associative Iris conditional operator.
+    fn parse_conditional(&mut self) -> Step<i64> {
+        let condition = self.parse_logical_or()?;
+        if !self.iris_conditions
+            || !matches!(
+                self.peek()?.map(|token| token.value),
+                Some(TokenValue::Punct(Punct::Question))
+            )
+        {
+            return Ok(condition);
+        }
+        self.next()?;
+        let when_true = self.nested(Self::parse_conditional)?;
+        let colon = self.expect_next()?;
+        if colon.value != TokenValue::Punct(Punct::Colon) {
+            return Err(StepExit::Error((
+                PreprocessorError::UnexpectedToken(colon.value),
+                colon.location,
+            )));
+        }
+        let when_false = self.nested(Self::parse_conditional)?;
+        Ok(if condition != 0 {
+            when_true
+        } else {
+            when_false
+        })
+    }
+
+    /// Evaluates one preprocessor expression using the configured condition dialect.
     pub fn evaluate_expression(&mut self) -> Step<i64> {
-        self.parse_logical_or()
+        self.parse_conditional()
     }
 }
 

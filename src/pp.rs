@@ -82,7 +82,7 @@ struct DirectiveProcessor<'a> {
     line_offset: i64,
     had_directive: bool,
     had_non_directive_token: bool,
-    allow_float_conditions: bool,
+    iris_conditions: bool,
 }
 
 pub fn convert_lexer_token(token: LexerToken) -> Result<Token, (PreprocessorError, Location)> {
@@ -137,7 +137,7 @@ impl<'a> DirectiveProcessor<'a> {
             line_offset: 0,
             had_directive: false,
             had_non_directive_token: false,
-            allow_float_conditions: false,
+            iris_conditions: false,
         }
     }
 
@@ -387,13 +387,8 @@ impl<'a> DirectiveProcessor<'a> {
     }
 
     fn evaluate_if_expression(&mut self, location: Location, line: Vec<Token>) -> Step<bool> {
-        let mut parser = if_parser::IfParser::new(
-            line,
-            &self.defines,
-            location,
-            true,
-            self.allow_float_conditions,
-        );
+        let mut parser =
+            if_parser::IfParser::new(line, &self.defines, location, true, self.iris_conditions);
         let res = parser.evaluate_expression()?;
 
         if let Some(token) = parser.peek()? {
@@ -998,10 +993,10 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Allows expanded floating-point values in `#if` and `#elif`, truncated toward zero.
+    /// Enables Iris conditions: float values truncate toward zero, and `?:` selects a value.
     /// Disabled by default; ordinary source values and `#line` expressions are unchanged.
-    pub fn set_allow_float_conditions(&mut self, allow: bool) {
-        self.directive_processor.allow_float_conditions = allow;
+    pub fn set_iris_conditions(&mut self, allow: bool) {
+        self.directive_processor.iris_conditions = allow;
     }
 
     pub fn add_define(
