@@ -1643,3 +1643,21 @@ fn nested_macro_arguments_stop_at_the_expansion_limit() {
     let mut pp = Preprocessor::new(&input);
     assert!(pp.any(|item| matches!(item, Err((PreprocessorError::RecursionLimitReached, _)))));
 }
+
+#[test]
+fn work_limit_bounds_macro_expansion_inside_conditions() {
+    let mut input = String::from("#define M0 0\n");
+    for level in 1..=40 {
+        input += &format!("#define M{level} M{p} + M{p}\n", p = level - 1);
+    }
+    input += "#if M40\n1\n#endif\n";
+    let mut pp = Preprocessor::new(&input);
+    pp.set_work_limit(100_000);
+    assert!(pp.any(|item| matches!(item, Err((PreprocessorError::RecursionLimitReached, _)))));
+}
+
+#[test]
+fn work_limit_is_unlimited_by_default() {
+    let mut pp = Preprocessor::new("#define A 1 + 1\n#if A\n2\n#endif\n");
+    assert!(pp.all(|item| item.is_ok()));
+}

@@ -44,6 +44,7 @@ struct DirectiveBlock {
 pub(super) struct DirectiveProcessor<'a> {
     pub(super) lexer: lexer::Lexer<'a>,
     defines: HashMap<String, Rc<Define>>,
+    pub(super) work: Cell<u64>,
     skipping: bool,
     blocks: Vec<DirectiveBlock>,
     line_offset: i64,
@@ -59,6 +60,7 @@ impl<'a> DirectiveProcessor<'a> {
         DirectiveProcessor {
             lexer: lexer::Lexer::new(input),
             defines: Default::default(),
+            work: Cell::new(u64::MAX),
             skipping: false,
             blocks: Default::default(),
             line_offset: 0,
@@ -316,8 +318,14 @@ impl<'a> DirectiveProcessor<'a> {
 
         let line = self.gather_until_newline()?;
 
-        let mut parser =
-            if_parser::IfParser::new(line, &self.defines, directive_location, false, false);
+        let mut parser = if_parser::IfParser::new(
+            line,
+            &self.defines,
+            &self.work,
+            directive_location,
+            false,
+            false,
+        );
         let line = parser.evaluate_expression()?;
 
         // Validates that the line is between 0 and 2^31 as per the C standard.
@@ -342,8 +350,14 @@ impl<'a> DirectiveProcessor<'a> {
     }
 
     fn evaluate_if_expression(&mut self, location: Location, line: Vec<Token>) -> Step<bool> {
-        let mut parser =
-            if_parser::IfParser::new(line, &self.defines, location, true, self.iris_conditions);
+        let mut parser = if_parser::IfParser::new(
+            line,
+            &self.defines,
+            &self.work,
+            location,
+            true,
+            self.iris_conditions,
+        );
         let res = parser.evaluate_expression()?;
 
         if let Some(token) = parser.peek()? {
@@ -595,6 +609,10 @@ impl<'a> DirectiveProcessor<'a> {
 }
 
 impl<'a> MeLexer for DirectiveProcessor<'a> {
+    fn charge(&self, location: Location) -> Step<()> {
+        charge_work(&self.work, location)
+    }
+
     fn step(&mut self) -> Step<Token> {
         let step = (|| {
             // TODO: if we are skipping invalid characters should be allowed.

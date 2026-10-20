@@ -1,7 +1,7 @@
 use crate::token::{Integer, PreprocessorError, Punct};
 
 use super::{Define, Location, MacroProcessor, MeLexer, Step, StepExit, Token, TokenValue};
-use std::{collections::HashMap, convert::TryInto, rc::Rc, vec};
+use std::{cell::Cell, collections::HashMap, convert::TryInto, rc::Rc, vec};
 
 /// Maximum recursive expression nesting before returning an error.
 const MAX_EXPRESSION_DEPTH: usize = 64;
@@ -9,6 +9,7 @@ const MAX_EXPRESSION_DEPTH: usize = 64;
 struct IfLexer<'macros> {
     tokens: vec::IntoIter<Token>,
     defines: &'macros HashMap<String, Rc<Define>>,
+    work: &'macros Cell<u64>,
 }
 
 pub(super) struct IfParser<'macros> {
@@ -30,6 +31,7 @@ impl<'macros> IfParser<'macros> {
     pub fn new(
         tokens: Vec<Token>,
         defines: &'macros HashMap<String, Rc<Define>>,
+        work: &'macros Cell<u64>,
         location: Location,
         parsing_if: bool,
         iris_conditions: bool,
@@ -38,6 +40,7 @@ impl<'macros> IfParser<'macros> {
             lexer: IfLexer {
                 tokens: tokens.into_iter(),
                 defines,
+                work,
             },
             macro_processor: MacroProcessor::default(),
             location,
@@ -526,5 +529,9 @@ impl<'macros> MeLexer for IfLexer<'macros> {
 
     fn apply_line_offset(&self, line: u32, _: Location) -> Step<u32> {
         Ok(line)
+    }
+
+    fn charge(&self, location: Location) -> Step<()> {
+        super::charge_work(self.work, location)
     }
 }

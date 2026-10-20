@@ -1,6 +1,7 @@
 use crate::lexer::{self, Token as LexerToken, TokenValue as LexerTokenValue};
 use crate::token::*;
 use std::{
+    cell::Cell,
     cmp::Ordering,
     collections::{HashMap, HashSet},
     convert::TryFrom,
@@ -68,6 +69,22 @@ trait MeLexer {
     fn step(&mut self) -> Step<Token>;
     fn get_define(&self, name: &str) -> Option<&Rc<Define>>;
     fn apply_line_offset(&self, line: u32, location: Location) -> Step<u32>;
+    /// Spends one unit of the preprocessing work budget for a macro-processed token.
+    fn charge(&self, location: Location) -> Step<()>;
+}
+
+/// Takes one token from `work`, failing once a configured budget is spent.
+fn charge_work(work: &Cell<u64>, location: Location) -> Step<()> {
+    match work.get().checked_sub(1) {
+        Some(left) => {
+            work.set(left);
+            Ok(())
+        }
+        None => Err(StepExit::Error((
+            PreprocessorError::RecursionLimitReached,
+            location,
+        ))),
+    }
 }
 
 /// Tokens one fully expanded macro argument may hold; nested arguments otherwise grow without bound.
@@ -342,6 +359,10 @@ impl MacroProcessor {
             fn apply_line_offset(&self, line: u32, _: Location) -> Step<u32> {
                 Ok(line)
             }
+
+            fn charge(&self, location: Location) -> Step<()> {
+                self.parent_lexer.charge(location)
+            }
         }
 
         let mut parameter_lexer = ExpandParameterLexer {
@@ -430,6 +451,7 @@ impl MacroProcessor {
 
     fn step(&mut self, lexer: &mut dyn MeLexer) -> Step<Token> {
         let token = self.step_internal(lexer)?;
+        lexer.charge(token.location)?;
 
         if let TokenValue::Ident(name) = &token.value {
             if name == "__LINE__" {
@@ -486,6 +508,17 @@ impl<'a> Preprocessor<'a> {
 
     /// Enables Iris conditions: float values truncate toward zero, and `?:` selects a value.
     /// Disabled by default; ordinary source values and `#line` expressions are unchanged.
+    /// Caps the macro-processed tokens, in output and in conditions, before failing with
+    /// `RecursionLimitReached`. Unlimited by default.
+    pub fn set_work_limit(&mut self, tokens: u64) {
+        self.directive_processor.work.set(tokens);
+    }
+
+    /// Budget left from [`Self::set_work_limit`]; zero means every later step fails.
+    pub fn work_remaining(&self) -> u64 {
+        self.directive_processor.work.get()
+    }
+
     pub fn set_iris_conditions(&mut self, allow: bool) {
         self.directive_processor.iris_conditions = allow;
     }
