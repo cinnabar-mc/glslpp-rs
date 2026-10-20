@@ -563,6 +563,19 @@ impl<'a> Preprocessor<'a> {
     }
 
     fn step(&mut self) -> Step<Token> {
+        self.step_tokens().map_err(|exit| match exit {
+            // Errors inside an expansion point at the outermost invocation, not the definition.
+            StepExit::Error((error, mut location))
+                if self.macro_processor.is_expanding_define() =>
+            {
+                location.line = self.macro_processor.define_line;
+                StepExit::Error((error, location))
+            }
+            exit => exit,
+        })
+    }
+
+    fn step_tokens(&mut self) -> Step<Token> {
         let token = self.macro_processor.step(&mut self.directive_processor)?;
 
         if token.opaque || token.trivia {

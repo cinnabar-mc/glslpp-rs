@@ -1661,3 +1661,17 @@ fn work_limit_is_unlimited_by_default() {
     let mut pp = Preprocessor::new("#define A 1 + 1\n#if A\n2\n#endif\n");
     assert!(pp.all(|item| item.is_ok()));
 }
+
+#[test]
+fn nested_expansion_errors_report_the_invocation_line() {
+    let mut pp = Preprocessor::new("#define ID(x) x\n#define BAD ID(1,2)\nvalue BAD\n");
+    pp.set_preserve_text(true);
+    let error = loop {
+        match pp.next_text() {
+            Some(Err((error, location))) => break (error, location.line()),
+            Some(Ok(_)) => continue,
+            None => panic!("expected an expansion error"),
+        }
+    };
+    assert_eq!(error, (PreprocessorError::TooManyDefineArguments, 3));
+}
