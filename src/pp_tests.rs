@@ -1589,3 +1589,32 @@ fn text_literals_are_not_accepted_as_condition_identifiers() {
         assert!(output.contains("after=ok"));
     }
 }
+
+#[test]
+fn macro_operands_keep_following_operators() {
+    for text_mode in [false, true] {
+        for condition in [
+            "VALUE / 10000 == 1",
+            "VALUE % 10000 == 2111",
+            "VALUE * 2 == 24222",
+            "VALUE + 1 == 12112",
+            "VALUE << 1 == 24222",
+        ] {
+            let source = format!("#if {}\n1\n#else\n0\n#endif\n", condition);
+            let mut pp = Preprocessor::new(&source);
+            pp.set_preserve_text(text_mode);
+            pp.add_define("VALUE", "12111").unwrap();
+            let values: Vec<_> = pp
+                .map(|token| token.unwrap().value)
+                .filter_map(|value| {
+                    if let TokenValue::Integer(value) = value {
+                        Some(value.value)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(values, [1], "{}", condition);
+        }
+    }
+}

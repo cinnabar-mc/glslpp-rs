@@ -49,16 +49,24 @@ impl<'macros> IfParser<'macros> {
         }
     }
 
-    /// Helper method to consume the next token without define expansion
-    fn raw_next(&mut self) -> Option<Token> {
-        self.carry
-            .take()
-            .or_else(|| self.macro_processor.step(&mut self.lexer).ok())
+    /// Consumes a token, skipping expansion steps while preserving errors and end of input.
+    fn raw_next(&mut self) -> Step<Option<Token>> {
+        if let Some(token) = self.carry.take() {
+            return Ok(Some(token));
+        }
+        loop {
+            match self.macro_processor.step(&mut self.lexer) {
+                Ok(token) => return Ok(Some(token)),
+                Err(StepExit::Continue) => continue,
+                Err(StepExit::Finished) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Helper method to consume the next token with define expansion
     fn next(&mut self) -> Step<Option<Token>> {
-        let token = match self.raw_next() {
+        let token = match self.raw_next()? {
             Some(t) => t,
             None => return Ok(None),
         };
@@ -90,7 +98,7 @@ impl<'macros> IfParser<'macros> {
     ///
     /// Returns an EOI error if there are no further tokens
     fn expect_raw_next(&mut self) -> Step<Token> {
-        self.raw_next().ok_or(StepExit::Error((
+        self.raw_next()?.ok_or(StepExit::Error((
             PreprocessorError::UnexpectedEndOfInput,
             self.location,
         )))
