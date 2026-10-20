@@ -14,6 +14,7 @@ pub(super) struct IfParser<'macros> {
     location: Location,
 
     parsing_if: bool,
+    allow_float_conditions: bool,
     carry: Option<Token>,
 }
 
@@ -21,12 +22,13 @@ impl<'macros> IfParser<'macros> {
     /// Builds a new IfParser that can be reused
     ///
     /// `parsing_if` indicates wether or not non defined macros should be
-    /// replaced with 0
+    /// replaced with 0. `allow_float_conditions` truncates expanded float atoms to integers.
     pub fn new(
         tokens: Vec<Token>,
         defines: &'macros HashMap<String, Rc<Define>>,
         location: Location,
         parsing_if: bool,
+        allow_float_conditions: bool,
     ) -> Self {
         IfParser {
             lexer: IfLexer {
@@ -37,6 +39,7 @@ impl<'macros> IfParser<'macros> {
             location,
 
             parsing_if,
+            allow_float_conditions,
             carry: None,
         }
     }
@@ -169,6 +172,7 @@ impl<'macros> IfParser<'macros> {
                 self.handle_defined()
             }
             TokenValue::Integer(int) => Ok(int.value as i64),
+            TokenValue::Float(float) if self.allow_float_conditions => Ok(float.value as i64),
             TokenValue::Punct(Punct::LeftParen) => {
                 let val = self.parse_logical_or()?;
 

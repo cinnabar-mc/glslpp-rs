@@ -82,6 +82,7 @@ struct DirectiveProcessor<'a> {
     line_offset: i64,
     had_directive: bool,
     had_non_directive_token: bool,
+    allow_float_conditions: bool,
 }
 
 pub fn convert_lexer_token(token: LexerToken) -> Result<Token, (PreprocessorError, Location)> {
@@ -136,6 +137,7 @@ impl<'a> DirectiveProcessor<'a> {
             line_offset: 0,
             had_directive: false,
             had_non_directive_token: false,
+            allow_float_conditions: false,
         }
     }
 
@@ -359,7 +361,8 @@ impl<'a> DirectiveProcessor<'a> {
 
         let line = self.gather_until_newline()?;
 
-        let mut parser = if_parser::IfParser::new(line, &self.defines, directive_location, false);
+        let mut parser =
+            if_parser::IfParser::new(line, &self.defines, directive_location, false, false);
         let line = parser.evaluate_expression()?;
 
         // Validates that the line is between 0 and 2^31 as per the C standard.
@@ -384,7 +387,13 @@ impl<'a> DirectiveProcessor<'a> {
     }
 
     fn evaluate_if_expression(&mut self, location: Location, line: Vec<Token>) -> Step<bool> {
-        let mut parser = if_parser::IfParser::new(line, &self.defines, location, true);
+        let mut parser = if_parser::IfParser::new(
+            line,
+            &self.defines,
+            location,
+            true,
+            self.allow_float_conditions,
+        );
         let res = parser.evaluate_expression()?;
 
         if let Some(token) = parser.peek()? {
@@ -987,6 +996,12 @@ impl<'a> Preprocessor<'a> {
             directive_processor: DirectiveProcessor::new(input),
             macro_processor: Default::default(),
         }
+    }
+
+    /// Allows expanded floating-point values in `#if` and `#elif`, truncated toward zero.
+    /// Disabled by default; ordinary source values and `#line` expressions are unchanged.
+    pub fn set_allow_float_conditions(&mut self, allow: bool) {
+        self.directive_processor.allow_float_conditions = allow;
     }
 
     pub fn add_define(

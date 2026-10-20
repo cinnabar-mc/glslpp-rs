@@ -1411,3 +1411,49 @@ fn add_define() {
     let mut pp = Preprocessor::new("#if~f>>~f");
     while let Some(_) = pp.next() {}
 }
+
+#[test]
+fn float_conditions_are_opt_in_and_use_expanded_macro_state() {
+    let input = "#define BASE 1.5
+        #define ALIAS BASE
+        #if 0
+        #undef BASE
+        #define BASE 9.5
+        #endif
+        #if ALIAS == 1 && ENV == 2
+        10
+        #endif
+        #undef BASE
+        #if BASE
+        99
+        #else
+        20
+        #endif
+        #if 0.9
+        99
+        #elif -1.5 == -1
+        30
+        #endif
+        ENV";
+    let mut pp = Preprocessor::new(input);
+    pp.set_allow_float_conditions(true);
+    pp.add_define("ENV", "2.5").unwrap();
+    let values: Vec<_> = pp.map(|item| item.unwrap().value).collect();
+    let integers: Vec<_> = values
+        .iter()
+        .filter_map(|value| match value {
+            TokenValue::Integer(integer) => Some(integer.value),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(integers, [10, 20, 30]);
+    assert!(matches!(values.last(), Some(TokenValue::Float(float)) if float.value == 2.5));
+    assert!(Preprocessor::new("#if 1.5\n10\n#endif").any(|item| item.is_err()));
+}
+
+#[test]
+fn float_conditions_do_not_relax_line_directives() {
+    let mut pp = Preprocessor::new("#line 1.5\n10");
+    pp.set_allow_float_conditions(true);
+    assert!(pp.any(|item| item.is_err()));
+}
