@@ -1618,3 +1618,18 @@ fn macro_operands_keep_following_operators() {
         }
     }
 }
+
+#[test]
+fn generated_lines_keep_original_line_macros_and_explicit_offsets() {
+    let mut pp =
+        Preprocessor::new("int a = __LINE__;\n\nint b = __LINE__;\n#line 80\nint c = __LINE__;");
+    pp.set_source_lines(vec![12, 12, 34, 35, 36]);
+    let values: Vec<_> = pp
+        .map(Result::unwrap)
+        .filter_map(|token| match token.value {
+            TokenValue::Integer(value) => Some(value.value),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(values, [12, 34, 81]);
+}

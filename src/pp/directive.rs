@@ -47,6 +47,7 @@ pub(super) struct DirectiveProcessor<'a> {
     skipping: bool,
     blocks: Vec<DirectiveBlock>,
     line_offset: i64,
+    pub(super) source_lines: Vec<u32>,
     had_directive: bool,
     had_non_directive_token: bool,
     pub(super) iris_conditions: bool,
@@ -61,6 +62,7 @@ impl<'a> DirectiveProcessor<'a> {
             skipping: false,
             blocks: Default::default(),
             line_offset: 0,
+            source_lines: Vec::new(),
             had_directive: false,
             had_non_directive_token: false,
             iris_conditions: false,
@@ -72,7 +74,17 @@ impl<'a> DirectiveProcessor<'a> {
     fn get_raw_lexer_token(&mut self) -> Step<LexerToken> {
         match self.lexer.next() {
             None => Finished.into(),
-            Some(Ok(tok)) => Ok(tok),
+            Some(Ok(mut tok)) => {
+                if let Some(line) = tok
+                    .location
+                    .line
+                    .checked_sub(1)
+                    .and_then(|line| self.source_lines.get(line as usize))
+                {
+                    tok.location.line = *line;
+                }
+                Ok(tok)
+            }
             Some(Err(err)) => Err(StepExit::Error(err)),
         }
     }

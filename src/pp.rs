@@ -488,6 +488,13 @@ impl<'a> Preprocessor<'a> {
         self.directive_processor.lexer.set_preserve_text(preserve);
     }
 
+    /// Sets original one-based line numbers for generated input lines before reading tokens.
+    /// Token byte offsets stay in the input; `__LINE__` and `#line` use the supplied lines.
+    /// Unmapped lines retain their input line number.
+    pub fn set_source_lines(&mut self, lines: Vec<u32>) {
+        self.directive_processor.source_lines = lines;
+    }
+
     /// Reads one expanded fragment while retaining its source invocation line.
     pub fn next_text(&mut self) -> Option<Result<text::TextToken, (PreprocessorError, Location)>> {
         loop {
