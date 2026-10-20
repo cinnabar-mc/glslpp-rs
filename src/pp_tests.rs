@@ -2,12 +2,28 @@ use super::lexer::{self, Token as LexerToken, TokenValue as LexerTokenValue};
 use super::pp::{convert_lexer_token, Preprocessor, PreprocessorItem};
 use super::token::{Float, Integer, Location, PreprocessorError, Punct, Token, TokenValue};
 
+#[test]
+fn text_output_preserves_literals_comments_and_macro_boundaries() {
+    let source = "#define NEG -1\n#if -NEG > 0\nvalue=NEG \\\n\"NEG\" /* NEG\n#if 0\n*/\nafter=0.50\n#endif\n";
+    let mut pp = Preprocessor::new(source);
+    pp.set_preserve_text(true);
+    pp.set_iris_conditions(true);
+    let mut output = String::new();
+    while let Some(token) = pp.next_text() {
+        output.push_str(&token.unwrap().text);
+    }
+    assert_eq!(
+        output,
+        "value=-1 \\\n\"NEG\" /* NEG\n#if 0\n*/\nafter=0.50\n"
+    );
+}
+
 struct NoopPreprocessor<'a> {
     lexer: lexer::Lexer<'a>,
 }
 
 impl<'a> NoopPreprocessor<'a> {
-    pub fn new(input: &'a str) -> NoopPreprocessor {
+    pub fn new(input: &'a str) -> NoopPreprocessor<'a> {
         NoopPreprocessor {
             lexer: lexer::Lexer::new(input),
         }
@@ -24,7 +40,9 @@ impl<'a> Iterator for NoopPreprocessor<'a> {
                     value: LexerTokenValue::NewLine,
                     ..
                 })) => continue,
-                Some(Ok(token)) => return Some(Ok(convert_lexer_token(token).unwrap())),
+                Some(Ok(token)) => {
+                    return Some(Ok(convert_lexer_token(token).unwrap().into_public()))
+                }
                 None => return None,
                 Some(Err(err)) => return Some(Err(err)),
             }
@@ -1527,4 +1545,47 @@ fn condition_negation_overflow_returns_an_error() {
         "#if -(-9223372036854775807 - 1)\n1\n#endif",
         PreprocessorError::IntegerOverflow,
     );
+}
+
+#[test]
+fn text_macros_keep_invocation_lines_and_property_spelling() {
+    let source = "entry=VALUE\n#define ADD(x) x+1\ncalc=ADD(2)\n#define LINE __LINE__\nline=LINE\nliteral=\"https://host/*literal*/\" \\u0041\n";
+    let mut pp = Preprocessor::new(source);
+    pp.set_preserve_text(true);
+    pp.add_define("VALUE", "0x10").unwrap();
+    let mut lines = Vec::new();
+    let mut output = String::new();
+    while let Some(token) = pp.next_text() {
+        let token = token.unwrap();
+        if token.text == "0x10" || token.text == "2" || token.text == "5" {
+            lines.push(token.line);
+        }
+        output.push_str(&token.text);
+    }
+    assert_eq!(lines, [1, 3, 5]);
+    assert_eq!(
+        output,
+        "entry=0x10\ncalc=2+1\nline=5\nliteral=\"https://host/*literal*/\" \\u0041\n"
+    );
+}
+
+#[test]
+fn text_literals_are_not_accepted_as_condition_identifiers() {
+    for condition in ["\\", "\"literal\"", "1.0.0"] {
+        let source = format!("#if {}\nbad=1\n#endif\nafter=ok\n", condition);
+        let mut pp = Preprocessor::new(&source);
+        pp.set_preserve_text(true);
+        pp.set_iris_conditions(true);
+        let mut output = String::new();
+        let mut errors = 0;
+        while let Some(token) = pp.next_text() {
+            match token {
+                Ok(token) => output.push_str(&token.text),
+                Err(_) => errors += 1,
+            }
+        }
+        assert_eq!(errors, 1, "{}", condition);
+        assert!(!output.contains("bad="));
+        assert!(output.contains("after=ok"));
+    }
 }

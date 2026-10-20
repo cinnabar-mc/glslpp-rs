@@ -20,6 +20,13 @@ impl Default for Location {
     }
 }
 
+impl Location {
+    /// Returns the original one-based source line.
+    pub fn line(&self) -> u32 {
+        self.line
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Punct {
     // Compound assignments

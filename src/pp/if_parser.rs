@@ -63,6 +63,12 @@ impl<'macros> IfParser<'macros> {
             None => return Ok(None),
         };
 
+        if token.opaque {
+            return Err(StepExit::Error((
+                PreprocessorError::UnexpectedToken(token.value),
+                token.location,
+            )));
+        }
         Ok(match token.value {
             TokenValue::Ident(ref name) if name != "defined" => {
                 match self.add_define(name, token.location)? {
@@ -111,20 +117,24 @@ impl<'macros> IfParser<'macros> {
     }
 
     fn add_define(&mut self, name: &str, location: Location) -> Step<Option<Token>> {
-        if self
-            .macro_processor
-            .start_define_invocation(name, location, &mut self.lexer)?
-        {
+        if self.macro_processor.start_define_invocation(
+            name,
+            location,
+            location,
+            false,
+            &mut self.lexer,
+        )? {
             Ok(None)
         } else if self.parsing_if {
-            Ok(Some(Token {
-                value: TokenValue::Integer(Integer {
+            Ok(Some(Token::generated(
+                TokenValue::Integer(Integer {
                     value: 0,
                     signed: true,
                     width: 64,
                 }),
                 location,
-            }))
+                "0".to_owned(),
+            )))
         } else {
             Err(StepExit::Error((
                 PreprocessorError::UnexpectedToken(TokenValue::Ident(name.to_string())),

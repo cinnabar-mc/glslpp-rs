@@ -271,6 +271,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: 1.into(),
             location: l(1, 0..1),
             leading_whitespace: true,
@@ -286,6 +287,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: 1.into(),
             location: l(1, 1..2),
             leading_whitespace: true,
@@ -297,6 +299,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: 2.into(),
             location: l(2, 7..8),
             leading_whitespace: true,
@@ -306,6 +309,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: 3.into(),
             location: l(2, 9..10),
             leading_whitespace: true,
@@ -316,6 +320,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: Punct::Plus.into(),
             location: l(2, 10..11),
             leading_whitespace: false,
@@ -326,6 +331,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: TokenValue::NewLine,
             location: l(2, 11..12),
             leading_whitespace: false,
@@ -336,6 +342,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: 4.into(),
             location: l(3, 12..13),
             leading_whitespace: true,
@@ -346,6 +353,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: TokenValue::NewLine,
             location: l(3, 13..13),
             leading_whitespace: false,

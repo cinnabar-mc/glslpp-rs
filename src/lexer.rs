@@ -79,12 +79,14 @@ impl<'a> Iterator for CharsAndLine<'a> {
 #[derive(Clone)]
 pub struct SkipBackslashNewline<'a> {
     inner: CharsAndLine<'a>,
+    preserve_text: bool,
 }
 
 impl<'a> SkipBackslashNewline<'a> {
     pub fn new(input: &'a str) -> Self {
         SkipBackslashNewline {
             inner: CharsAndLine::new(input),
+            preserve_text: false,
         }
     }
 
@@ -99,7 +101,7 @@ impl<'a> Iterator for SkipBackslashNewline<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let mut current = self.inner.next()?;
 
-        while current.0 == '\\' {
+        while current.0 == '\\' && !self.preserve_text {
             let mut peek_inner = self.inner.clone();
             if let Some(('\n', _)) = peek_inner.next() {
                 self.inner = peek_inner;
@@ -122,6 +124,9 @@ impl<'a> Iterator for SkipBackslashNewline<'a> {
 #[derive(Clone)]
 pub struct ReplaceComments<'a> {
     inner: SkipBackslashNewline<'a>,
+    preserve_text: bool,
+    quote: Option<char>,
+    escaped: bool,
 }
 
 // The lexer wants to know when whitespace is a comment to know if a comment was ever processed.
@@ -133,6 +138,9 @@ impl<'a> ReplaceComments<'a> {
     pub fn new(input: &'a str) -> Self {
         ReplaceComments {
             inner: SkipBackslashNewline::new(input),
+            preserve_text: false,
+            quote: None,
+            escaped: false,
         }
     }
 
@@ -146,6 +154,21 @@ impl<'a> Iterator for ReplaceComments<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.inner.next()?;
+        if self.preserve_text {
+            if let Some(quote) = self.quote {
+                if self.escaped {
+                    self.escaped = false;
+                } else if current.0 == '\\' {
+                    self.escaped = true;
+                } else if current.0 == quote {
+                    self.quote = None;
+                }
+                return Some(current);
+            }
+            if matches!(current.0, '\'' | '"') {
+                self.quote = Some(current.0);
+            }
+        }
 
         if current.0 != '/' {
             debug_assert!(current.0 != COMMENT_SENTINEL_VALUE);
@@ -199,6 +222,8 @@ struct LexerCharIterator<'a> {
     peeked: Option<(CharAndLine, *const u8)>,
     last_consumed: (CharAndLine, *const u8),
     input_start: *const u8,
+    consumed_end: *const u8,
+    peeked_end: *const u8,
 }
 
 pub const NONE_CONSUMED_SENTINEL_VALUE: char = '\r';
@@ -210,14 +235,21 @@ impl<'a> LexerCharIterator<'a> {
             peeked: None,
             last_consumed: ((NONE_CONSUMED_SENTINEL_VALUE, 0), input.as_bytes().as_ptr()),
             input_start: input.as_bytes().as_ptr(),
+            consumed_end: input.as_ptr(),
+            peeked_end: input.as_ptr(),
         }
     }
     fn next_char(&mut self) -> Option<char> {
         self.last_consumed = match self.peeked.take() {
-            Some(v) => v,
+            Some(v) => {
+                self.consumed_end = self.peeked_end;
+                v
+            }
             None => {
                 let ptr = self.inner.get_current_ptr();
-                (self.inner.next()?, ptr)
+                let value = self.inner.next()?;
+                self.consumed_end = self.inner.get_current_ptr();
+                (value, ptr)
             }
         };
         Some(self.last_consumed.0 .0)
@@ -229,6 +261,7 @@ impl<'a> LexerCharIterator<'a> {
             None => {
                 let ptr = self.inner.get_current_ptr();
                 let next = self.inner.next()?;
+                self.peeked_end = self.inner.get_current_ptr();
                 self.peeked = Some((next, ptr));
                 Some(next.0)
             }
@@ -255,6 +288,8 @@ pub enum TokenValue {
     // Preprocessor specific token values
     Hash,
     NewLine,
+    Trivia,
+    Opaque(String),
 
     // Regular token values
     Ident(String),
@@ -275,10 +310,13 @@ pub struct Token {
     pub location: Location,
     pub leading_whitespace: bool,
     pub start_of_line: bool,
+    pub text: String,
 }
 
 pub type LexerItem = Result<Token, (PreprocessorError, Location)>;
 pub struct Lexer<'a> {
+    source: &'a str,
+    preserve_text: bool,
     inner: LexerCharIterator<'a>,
     leading_whitespace: bool,
     start_of_line: bool,
@@ -289,11 +327,20 @@ impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Self {
         // TODO bail out on source that is too large.
         Lexer {
+            source: input,
+            preserve_text: false,
             inner: LexerCharIterator::new(input),
             leading_whitespace: true,
             start_of_line: true,
             had_comments: false,
         }
+    }
+
+    /// Preserves trivia and opaque property literals instead of requiring GLSL tokens.
+    pub(crate) fn set_preserve_text(&mut self, preserve: bool) {
+        self.preserve_text = preserve;
+        self.inner.inner.preserve_text = preserve;
+        self.inner.inner.inner.preserve_text = preserve;
     }
 
     pub fn had_comments(&self) -> bool {
@@ -562,7 +609,11 @@ impl<'a> Iterator for Lexer<'a> {
                     self.start_of_line = was_start_of_line;
                     self.leading_whitespace = true;
                     self.inner.next_char();
-                    continue;
+                    if self.preserve_text {
+                        Ok(TokenValue::Trivia)
+                    } else {
+                        continue;
+                    }
                 }
                 '\n' => {
                     self.leading_whitespace = true;
@@ -571,6 +622,20 @@ impl<'a> Iterator for Lexer<'a> {
                     Ok(TokenValue::NewLine)
                 }
 
+                '\'' | '"' if self.preserve_text => {
+                    let quote = self.inner.next_char().unwrap();
+                    let mut escaped = false;
+                    while let Some(c) = self.inner.next_char() {
+                        if escaped {
+                            escaped = false;
+                        } else if c == '\\' {
+                            escaped = true;
+                        } else if c == quote {
+                            break;
+                        }
+                    }
+                    Ok(TokenValue::Opaque(String::new()))
+                }
                 c @ '0'..='9' => {
                     self.inner.next_char();
                     self.parse_number(c)
@@ -590,18 +655,43 @@ impl<'a> Iterator for Lexer<'a> {
                     if current_char.is_xid_start() || current_char == '_' {
                         self.parse_identifier()
                     } else {
-                        self.parse_punctuation()
+                        let saved = self.inner.clone();
+                        match self.parse_punctuation() {
+                            Err(_) if self.preserve_text => {
+                                self.inner = saved;
+                                self.inner.next_char();
+                                Ok(TokenValue::Opaque(String::new()))
+                            }
+                            result => result,
+                        }
                     }
                 }
             };
 
-            location.end = self.inner.get_last_consumed_end_offset() as u32;
+            location.end = if self.preserve_text {
+                (self.inner.consumed_end as usize - self.inner.input_start as usize) as u32
+            } else {
+                self.inner.get_last_consumed_end_offset() as u32
+            };
+            let text = if self.preserve_text {
+                self.source[location.start as usize..location.end as usize].to_owned()
+            } else {
+                String::new()
+            };
+            let value = match value {
+                Ok(TokenValue::Opaque(ref value)) if value.is_empty() => {
+                    Ok(TokenValue::Opaque(text.clone()))
+                }
+                Err(_) if self.preserve_text => Ok(TokenValue::Opaque(text.clone())),
+                value => value,
+            };
 
             return Some(value.map_err(|e| (e, Default::default())).map(|t| Token {
                 value: t,
                 location,
                 leading_whitespace: had_leading_whitespace,
                 start_of_line: was_start_of_line,
+                text,
             }));
         }
 
@@ -620,6 +710,11 @@ impl<'a> Iterator for Lexer<'a> {
                 },
                 leading_whitespace: self.leading_whitespace,
                 start_of_line: false,
+                text: if self.preserve_text {
+                    "\n".to_owned()
+                } else {
+                    String::new()
+                },
             }))
         } else {
             None

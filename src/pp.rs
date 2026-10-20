@@ -7,7 +7,11 @@ use std::{
     rc::Rc,
 };
 
+mod directive;
 mod if_parser;
+use self::directive::DirectiveProcessor;
+pub mod text;
+use self::text::SourceToken as Token;
 
 #[derive(Clone, PartialEq, Debug)]
 struct Define {
@@ -21,10 +25,25 @@ struct Define {
 struct DefineInvocation {
     define: Rc<Define>,
     define_position: usize,
+    location: Location,
+    space: bool,
+    first: bool,
 
     parameters: Vec<Vec<Token>>,
     parameter_expanding: usize,
     parameter_position: usize,
+}
+
+impl DefineInvocation {
+    /// Applies invocation spacing and source lines to a replacement token.
+    fn output_token(&mut self, mut token: Token) -> Token {
+        token.output_location = self.location;
+        if self.first {
+            token.space = self.space;
+            self.first = false;
+        }
+        token
+    }
 }
 
 pub type Step<T> = Result<T, StepExit>;
@@ -58,6 +77,12 @@ fn make_unexpected_error(token: LexerToken) -> StepExit {
         LexerTokenValue::Ident(s) => PreprocessorError::UnexpectedToken(TokenValue::Ident(s)),
         LexerTokenValue::Punct(p) => PreprocessorError::UnexpectedToken(TokenValue::Punct(p)),
         LexerTokenValue::NewLine => PreprocessorError::UnexpectedNewLine,
+        LexerTokenValue::Opaque(value) => {
+            PreprocessorError::UnexpectedToken(TokenValue::Ident(value))
+        }
+        LexerTokenValue::Trivia => {
+            PreprocessorError::UnexpectedToken(TokenValue::Ident(token.text))
+        }
         LexerTokenValue::Hash => PreprocessorError::UnexpectedHash,
     };
     StepExit::Error((error, token.location))
@@ -67,52 +92,37 @@ fn make_line_overflow_error(location: Location) -> StepExit {
     StepExit::Error((PreprocessorError::LineOverflow, location))
 }
 
-struct DirectiveBlock {
-    start_location: Location,
-    had_valid_segment: bool,
-    had_else: bool,
-    outer_skipped: bool,
-}
-
-struct DirectiveProcessor<'a> {
-    lexer: lexer::Lexer<'a>,
-    defines: HashMap<String, Rc<Define>>,
-    skipping: bool,
-    blocks: Vec<DirectiveBlock>,
-    line_offset: i64,
-    had_directive: bool,
-    had_non_directive_token: bool,
-    iris_conditions: bool,
-}
-
-pub fn convert_lexer_token(token: LexerToken) -> Result<Token, (PreprocessorError, Location)> {
+/// Carries lexical spelling and spacing through macro expansion.
+pub(crate) fn convert_lexer_token(
+    token: LexerToken,
+) -> Result<Token, (PreprocessorError, Location)> {
     let location = token.location;
-    match token.value {
-        LexerTokenValue::Integer(i) => Ok(Token {
-            value: TokenValue::Integer(i),
-            location,
-        }),
-        LexerTokenValue::Float(f) => Ok(Token {
-            value: TokenValue::Float(f),
-            location,
-        }),
-        LexerTokenValue::Ident(s) => Ok(Token {
-            value: TokenValue::Ident(s),
-            location,
-        }),
-        LexerTokenValue::Punct(p) => Ok(Token {
-            value: TokenValue::Punct(p),
-            location,
-        }),
-
-        LexerTokenValue::Hash => Err((PreprocessorError::UnexpectedHash, location)),
-        // In all the places that call convert_lexer_token, newlines are handled specially as they
-        // are either noops, or act as a separator.
-        LexerTokenValue::NewLine => unreachable!(),
-    }
+    let opaque = matches!(token.value, LexerTokenValue::Opaque(_));
+    let trivia = matches!(
+        token.value,
+        LexerTokenValue::Trivia | LexerTokenValue::NewLine
+    );
+    let value = match token.value {
+        LexerTokenValue::Integer(value) => TokenValue::Integer(value),
+        LexerTokenValue::Float(value) => TokenValue::Float(value),
+        LexerTokenValue::Ident(value) | LexerTokenValue::Opaque(value) => TokenValue::Ident(value),
+        LexerTokenValue::Punct(value) => TokenValue::Punct(value),
+        LexerTokenValue::Trivia | LexerTokenValue::NewLine => TokenValue::Ident(token.text.clone()),
+        LexerTokenValue::Hash => return Err((PreprocessorError::UnexpectedHash, location)),
+    };
+    Ok(Token {
+        value,
+        location,
+        output_location: location,
+        text: token.text,
+        space: token.leading_whitespace,
+        trivia,
+        opaque,
+    })
 }
 
-pub fn convert_lexer_token_to_step(token: LexerToken) -> Step<Token> {
+/// Converts a lexical token into the internal preprocessing step type.
+fn convert_lexer_token_to_step(token: LexerToken) -> Step<Token> {
     convert_lexer_token(token).map_err(StepExit::Error)
 }
 
@@ -125,549 +135,6 @@ fn legal_redefinition(a: &Define, b: &Define) -> bool {
             .iter()
             .zip(&b.tokens)
             .all(|(ta, tb)| ta.value == tb.value)
-}
-
-impl<'a> DirectiveProcessor<'a> {
-    pub fn new(input: &'a str) -> DirectiveProcessor {
-        DirectiveProcessor {
-            lexer: lexer::Lexer::new(input),
-            defines: Default::default(),
-            skipping: false,
-            blocks: Default::default(),
-            line_offset: 0,
-            had_directive: false,
-            had_non_directive_token: false,
-            iris_conditions: false,
-        }
-    }
-
-    fn get_lexer_token(&mut self) -> Step<LexerToken> {
-        match self.lexer.next() {
-            None => Finished.into(),
-            Some(Ok(tok)) => Ok(tok),
-            Some(Err(err)) => Err(StepExit::Error(err)),
-        }
-    }
-
-    fn expect_a_lexer_token(&mut self, current_location: Location) -> Step<LexerToken> {
-        match self.get_lexer_token() {
-            Ok(token) => Ok(token),
-            Err(Finished) => Err(StepExit::Error((
-                PreprocessorError::UnexpectedEndOfInput,
-                current_location,
-            ))),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn expect_lexer_token(
-        &mut self,
-        expected: LexerTokenValue,
-        current_location: Location,
-    ) -> Step<Location> {
-        let token = self.expect_a_lexer_token(current_location)?;
-        if token.value == expected {
-            Ok(token.location)
-        } else {
-            Err(make_unexpected_error(token))
-        }
-    }
-
-    fn expect_lexer_ident(&mut self, current_location: Location) -> Step<(String, Location)> {
-        let token = self.expect_a_lexer_token(current_location)?;
-        if let LexerTokenValue::Ident(name) = token.value {
-            Ok((name, token.location))
-        } else {
-            Err(make_unexpected_error(token))
-        }
-    }
-
-    fn consume_until_newline(&mut self) -> Step<()> {
-        loop {
-            // TODO allow unexpected character errors because we are skipping.
-            if let LexerTokenValue::NewLine = self.get_lexer_token()?.value {
-                return Ok(());
-            }
-        }
-    }
-
-    fn gather_until_newline(&mut self) -> Step<Vec<Token>> {
-        let mut tokens = Vec::new();
-        loop {
-            let token = self.get_lexer_token()?;
-            if token.value == LexerTokenValue::NewLine {
-                return Ok(tokens);
-            }
-            tokens.push(convert_lexer_token_to_step(token)?);
-        }
-    }
-
-    fn parse_define_directive(&mut self, directive_location: Location) -> Step<()> {
-        if self.skipping {
-            return self.consume_until_newline();
-        }
-
-        let (name, name_location) = self.expect_lexer_ident(directive_location)?;
-
-        // TODO validate the name?
-        let mut define = Define {
-            name,
-            function_like: false,
-            params: Default::default(),
-            tokens: Default::default(),
-        };
-
-        // TODO what if token is none? EOF but still need to check it is not a redefinition?
-        let mut token = self.get_lexer_token()?;
-
-        // The is a function-like define, parse the argument list, leaving token as the next
-        // token.
-        if token.value == Punct::LeftParen.into() && !token.leading_whitespace {
-            define.function_like = true;
-            let mut first_param = true;
-            loop {
-                token = self.get_lexer_token()?;
-                match &token.value {
-                    LexerTokenValue::Punct(Punct::RightParen) => {
-                        token = self.get_lexer_token()?;
-                        break;
-                    }
-
-                    LexerTokenValue::Ident(param_name) => {
-                        if !first_param {
-                            return Err(make_unexpected_error(token));
-                        }
-                        first_param = false;
-                        define
-                            .params
-                            .insert(param_name.clone(), define.params.len());
-                    }
-
-                    LexerTokenValue::Punct(Punct::Comma) => {
-                        if first_param {
-                            return Err(make_unexpected_error(token));
-                        }
-
-                        let (param_name, param_location) =
-                            self.expect_lexer_ident(token.location)?;
-                        if define.params.contains_key(&param_name) {
-                            return Err(StepExit::Error((
-                                PreprocessorError::DuplicateParameter,
-                                param_location,
-                            )));
-                        }
-                        define.params.insert(param_name, define.params.len());
-                    }
-                    _ => {
-                        return Err(make_unexpected_error(token));
-                    }
-                }
-            }
-        }
-
-        // Tokens until the newline are that define's tokens (including the current one)
-        loop {
-            if token.value == LexerTokenValue::NewLine {
-                break;
-            }
-            define.tokens.push(convert_lexer_token_to_step(token)?);
-            token = self.get_lexer_token()?;
-        }
-
-        // Defines are allowed to be redefined if they are exactly the same up to token locations.
-        if let Some(previous_define) = self.defines.get(&define.name) {
-            if legal_redefinition(&*previous_define, &define) {
-                Ok(())
-            } else {
-                Err(StepExit::Error((
-                    PreprocessorError::DefineRedefined,
-                    name_location,
-                )))
-            }
-        } else {
-            self.defines.insert(define.name.clone(), Rc::new(define));
-            Ok(())
-        }
-    }
-
-    fn add_define(
-        &mut self,
-        name: &str,
-        content: &str,
-    ) -> Result<(), (PreprocessorError, Location)> {
-        let mut define = Define {
-            name: name.to_string(),
-            function_like: false,
-            params: Default::default(),
-            tokens: Default::default(),
-        };
-
-        // Convert the content to tokens and add it to the define.
-        let mut lexer = lexer::Lexer::new(content);
-        loop {
-            match lexer.next() {
-                Some(Ok(lexer_token)) => {
-                    // Skip over newlines (the lexer always adds a newline, which would cause an
-                    // error in convert_lexer_token).
-                    if lexer_token.value == LexerTokenValue::NewLine {
-                        continue;
-                    }
-
-                    define.tokens.push(convert_lexer_token(lexer_token)?);
-                }
-
-                Some(Err(err)) => return Err(err),
-                None => break,
-            }
-        }
-
-        // Note this overwrites existing defines, we might want to add an option to make this
-        // an error in the future.
-        self.defines.insert(define.name.clone(), Rc::new(define));
-
-        Ok(())
-    }
-
-    fn parse_undef_directive(&mut self, directive_location: Location) -> Step<()> {
-        if self.skipping {
-            return self.consume_until_newline();
-        }
-
-        let (name, name_location) = self.expect_lexer_ident(directive_location)?;
-        // TODO check predefine
-        // It is valid to undef a name that is not defined.
-        self.defines.remove(&name);
-
-        self.expect_lexer_token(LexerTokenValue::NewLine, name_location)?;
-        Ok(())
-    }
-
-    fn parse_error_directive(&mut self, directive_location: Location) -> Step<()> {
-        if self.skipping {
-            self.consume_until_newline()
-        } else {
-            // TODO consume the rest of the line and make a nice error message
-            Err(StepExit::Error((
-                PreprocessorError::ErrorDirective,
-                directive_location,
-            )))
-        }
-    }
-
-    fn parse_line_directive(&mut self, directive_location: Location) -> Step<()> {
-        if self.skipping {
-            return self.consume_until_newline();
-        }
-
-        let line = self.gather_until_newline()?;
-
-        let mut parser =
-            if_parser::IfParser::new(line, &self.defines, directive_location, false, false);
-        let line = parser.evaluate_expression()?;
-
-        // Validates that the line is between 0 and 2^31 as per the C standard.
-        if line as u64 >= (1 << 32) {
-            return Err(make_line_overflow_error(directive_location));
-        }
-        self.line_offset = line - directive_location.line as i64;
-
-        if parser.peek()?.is_some() {
-            // TODO figure out what to do with the file, either number or string?
-            let _source_id = parser.evaluate_expression()?;
-        }
-
-        if let Some(token) = parser.peek()? {
-            return Err(StepExit::Error((
-                PreprocessorError::UnexpectedToken(token.value),
-                token.location,
-            )));
-        }
-
-        Ok(())
-    }
-
-    fn evaluate_if_expression(&mut self, location: Location, line: Vec<Token>) -> Step<bool> {
-        let mut parser =
-            if_parser::IfParser::new(line, &self.defines, location, true, self.iris_conditions);
-        let res = parser.evaluate_expression()?;
-
-        if let Some(token) = parser.peek()? {
-            Err(StepExit::Error((
-                PreprocessorError::UnexpectedToken(token.value),
-                token.location,
-            )))
-        } else {
-            Ok(res != 0)
-        }
-    }
-
-    fn parse_if_directive(&mut self, directive_location: Location) -> Step<()> {
-        self.parse_if_like_directive(directive_location, |this, location| {
-            let line = this.gather_until_newline()?;
-            this.evaluate_if_expression(location, line)
-        })
-    }
-
-    fn parse_ifdef_directive(&mut self, directive_location: Location) -> Step<()> {
-        self.parse_if_like_directive(directive_location, |this, location| {
-            let (name, name_location) = this.expect_lexer_ident(location)?;
-            this.expect_lexer_token(LexerTokenValue::NewLine, name_location)?;
-            Ok(this.defines.contains_key(&name))
-        })
-    }
-
-    fn parse_ifndef_directive(&mut self, directive_location: Location) -> Step<()> {
-        self.parse_if_like_directive(directive_location, |this, location| {
-            let (name, name_location) = this.expect_lexer_ident(location)?;
-            this.expect_lexer_token(LexerTokenValue::NewLine, name_location)?;
-            Ok(!this.defines.contains_key(&name))
-        })
-    }
-
-    fn parse_elif_directive(&mut self, directive_location: Location) -> Step<()> {
-        self.skipping = true;
-
-        // Do checks that the #elif block is well structured even if skipping.
-        let block = self.blocks.last().ok_or(StepExit::Error((
-            PreprocessorError::ElifOutsideOfBlock,
-            directive_location,
-        )))?;
-
-        if block.had_else {
-            return Err(StepExit::Error((
-                PreprocessorError::ElifAfterElse,
-                directive_location,
-            )));
-        }
-
-        // The condition isn't parsed if it doesn't need to (and doesn't produce errors).
-        if block.outer_skipped || block.had_valid_segment {
-            return self.consume_until_newline();
-        }
-
-        let line = self.gather_until_newline()?;
-        if self.evaluate_if_expression(directive_location, line)? {
-            self.skipping = false;
-            self.blocks.last_mut().unwrap().had_valid_segment = true;
-        }
-
-        Ok(())
-    }
-
-    fn parse_else_directive(&mut self, directive_location: Location) -> Step<()> {
-        self.expect_lexer_token(LexerTokenValue::NewLine, directive_location)?;
-
-        let block = self.blocks.last_mut().ok_or(StepExit::Error((
-            PreprocessorError::ElseOutsideOfBlock,
-            directive_location,
-        )))?;
-
-        // #else can only appear once in a block.
-        if block.had_else {
-            Err(StepExit::Error((
-                PreprocessorError::MoreThanOneElse,
-                directive_location,
-            )))
-        } else {
-            self.skipping = block.outer_skipped || block.had_valid_segment;
-            block.had_else = true;
-            Ok(())
-        }
-    }
-
-    fn parse_endif_directive(&mut self, directive_location: Location) -> Step<()> {
-        let block = self.blocks.pop().ok_or(StepExit::Error((
-            PreprocessorError::EndifOutsideOfBlock,
-            directive_location,
-        )))?;
-
-        // After #endif we start processing tokens iff the block was not skipped.
-        self.skipping = block.outer_skipped;
-
-        if self.skipping {
-            self.consume_until_newline()
-        } else {
-            self.expect_lexer_token(LexerTokenValue::NewLine, directive_location)?;
-            Ok(())
-        }
-    }
-
-    fn parse_if_like_directive(
-        &mut self,
-        directive_location: Location,
-        parse: impl Fn(&mut DirectiveProcessor, Location) -> Step<bool>,
-    ) -> Step<()> {
-        if self.skipping {
-            self.blocks.push(DirectiveBlock {
-                start_location: directive_location,
-                had_valid_segment: false,
-                had_else: false,
-                outer_skipped: true,
-            });
-            self.consume_until_newline()
-        } else {
-            let result = parse(self, directive_location)?;
-            self.skipping = !result;
-
-            self.blocks.push(DirectiveBlock {
-                start_location: directive_location,
-                had_valid_segment: !self.skipping,
-                had_else: false,
-                outer_skipped: false,
-            });
-            Ok(())
-        }
-    }
-
-    fn parse_version_directive(&mut self, directive_location: Location) -> Step<Token> {
-        if self.skipping {
-            self.consume_until_newline()?;
-            Continue.into()
-        } else {
-            Ok(Token {
-                location: directive_location,
-                value: TokenValue::Version(Version {
-                    tokens: self.gather_until_newline()?,
-                    is_first_directive: !(self.had_directive || self.had_non_directive_token),
-                    has_comments_before: self.lexer.had_comments(),
-                }),
-            })
-        }
-    }
-
-    fn parse_extension_directive(&mut self, directive_location: Location) -> Step<Token> {
-        if self.skipping {
-            self.consume_until_newline()?;
-            Continue.into()
-        } else {
-            Ok(Token {
-                location: directive_location,
-                value: TokenValue::Extension(Extension {
-                    tokens: self.gather_until_newline()?,
-                    has_non_directive_before: self.had_non_directive_token,
-                }),
-            })
-        }
-    }
-
-    fn parse_pragma_directive(&mut self, directive_location: Location) -> Step<Token> {
-        if self.skipping {
-            self.consume_until_newline()?;
-            Continue.into()
-        } else {
-            Ok(Token {
-                location: directive_location,
-                value: TokenValue::Pragma(Pragma {
-                    tokens: self.gather_until_newline()?,
-                }),
-            })
-        }
-    }
-
-    fn parse_directive(&mut self, hash_location: Location) -> Step<Token> {
-        let token = self.expect_a_lexer_token(hash_location)?;
-
-        if let LexerTokenValue::Ident(ref directive) = token.value {
-            match directive.as_str() {
-                // TODO elif line
-                "error" => self.parse_error_directive(token.location)?,
-                "line" => self.parse_line_directive(token.location)?,
-
-                "define" => self.parse_define_directive(token.location)?,
-                "undef" => self.parse_undef_directive(token.location)?,
-
-                "if" => self.parse_if_directive(token.location)?,
-                "ifdef" => self.parse_ifdef_directive(token.location)?,
-                "ifndef" => self.parse_ifndef_directive(token.location)?,
-                "elif" => self.parse_elif_directive(token.location)?,
-                "else" => self.parse_else_directive(token.location)?,
-                "endif" => self.parse_endif_directive(token.location)?,
-
-                "version" => {
-                    let result = self.parse_version_directive(token.location);
-                    self.had_directive = true;
-                    return result;
-                }
-                "extension" => {
-                    let result = self.parse_extension_directive(token.location);
-                    self.had_directive = true;
-                    return result;
-                }
-                "pragma" => {
-                    let result = self.parse_pragma_directive(token.location);
-                    self.had_directive = true;
-                    return result;
-                }
-                _ => {
-                    if !self.skipping {
-                        return Err(StepExit::Error((
-                            PreprocessorError::UnknownDirective,
-                            token.location,
-                        )));
-                    }
-                }
-            }
-            self.had_directive = true;
-            Continue.into()
-        } else if !self.skipping {
-            make_unexpected_error(token).into()
-        } else {
-            Continue.into()
-        }
-    }
-}
-
-impl<'a> MeLexer for DirectiveProcessor<'a> {
-    fn step(&mut self) -> Step<Token> {
-        let step = (|| {
-            // TODO: if we are skipping invalid characters should be allowed.
-            let lexer_token = self.get_lexer_token()?;
-            match lexer_token.value {
-                LexerTokenValue::NewLine => Continue.into(),
-                LexerTokenValue::Hash => {
-                    if lexer_token.start_of_line {
-                        self.parse_directive(lexer_token.location)
-                    } else if !self.skipping {
-                        make_unexpected_error(lexer_token).into()
-                    } else {
-                        Continue.into()
-                    }
-                }
-
-                _ => {
-                    if !self.skipping {
-                        self.had_non_directive_token = true;
-                        convert_lexer_token_to_step(lexer_token)
-                    } else {
-                        Continue.into()
-                    }
-                }
-            }
-        })();
-
-        if step == Err(StepExit::Finished) {
-            if let Some(block) = self.blocks.pop() {
-                return Err(StepExit::Error((
-                    PreprocessorError::UnfinishedBlock,
-                    block.start_location,
-                )));
-            }
-        }
-
-        step
-    }
-
-    fn get_define(&self, name: &str) -> Option<&Rc<Define>> {
-        self.defines.get(name)
-    }
-
-    fn apply_line_offset(&self, line: u32, location: Location) -> Step<u32> {
-        if let Ok(offset_line) = u32::try_from(line as i64 + self.line_offset) {
-            Ok(offset_line)
-        } else {
-            Err(make_line_overflow_error(location))
-        }
-    }
 }
 
 #[derive(Default)]
@@ -684,6 +151,8 @@ impl MacroProcessor {
         &mut self,
         name: &str,
         location: Location,
+        output_location: Location,
+        space: bool,
         lexer: &mut dyn MeLexer,
     ) -> Step<bool> {
         // Defines can be expanding only once, it is not possible to do recursive defines
@@ -695,10 +164,13 @@ impl MacroProcessor {
             let mut invocation = DefineInvocation {
                 define: define.clone(),
                 define_position: 0,
+                location: output_location,
+                space,
+                first: true,
 
                 parameters: Default::default(),
                 parameter_position: 0,
-                parameter_expanding: std::usize::MAX,
+                parameter_expanding: usize::MAX,
             };
 
             // If this is a not a function-like define, __LINE__ inside the define is the line of the first
@@ -712,6 +184,7 @@ impl MacroProcessor {
                     Ok(Token {
                         value: TokenValue::Punct(Punct::LeftParen),
                         location,
+                        ..
                     }) => location,
 
                     // Function-like macros are not processed if there is no ( right after the identifier
@@ -887,6 +360,8 @@ impl MacroProcessor {
                         if processor.start_define_invocation(
                             name,
                             token.location,
+                            token.output_location,
+                            token.space,
                             &mut parameter_lexer,
                         )? {
                             continue;
@@ -913,9 +388,9 @@ impl MacroProcessor {
             if let Some(argument) = invocation.parameters.get(invocation.parameter_expanding) {
                 if let Some(token) = argument.get(invocation.parameter_position) {
                     invocation.parameter_position += 1;
-                    return Ok(token.clone());
+                    return Ok(invocation.output_token(token.clone()));
                 } else {
-                    invocation.parameter_expanding = std::usize::MAX;
+                    invocation.parameter_expanding = usize::MAX;
                     return Continue.into();
                 }
             }
@@ -933,7 +408,7 @@ impl MacroProcessor {
                     }
                 }
 
-                return Ok(token.clone());
+                return Ok(invocation.output_token(token.clone()));
             } else {
                 self.defines_being_expanded.remove(&invocation.define.name);
                 self.define_invocations.pop();
@@ -956,14 +431,19 @@ impl MacroProcessor {
                     token.location.line
                 };
 
-                return Ok(Token {
-                    value: TokenValue::Integer(Integer {
-                        value: lexer.apply_line_offset(line, token.location)? as u64,
+                let value = lexer.apply_line_offset(line, token.location)? as u64;
+                let mut generated = Token::generated(
+                    TokenValue::Integer(Integer {
+                        value,
                         signed: false,
                         width: 32,
                     }),
-                    location: token.location,
-                });
+                    token.location,
+                    value.to_string(),
+                );
+                generated.output_location = token.output_location;
+                generated.space = token.space;
+                return Ok(generated);
             }
         }
 
@@ -983,13 +463,15 @@ impl MacroProcessor {
 pub struct Preprocessor<'a> {
     directive_processor: DirectiveProcessor<'a>,
     macro_processor: MacroProcessor,
+    text_output: text::Output,
 }
 
 impl<'a> Preprocessor<'a> {
-    pub fn new(input: &'a str) -> Preprocessor {
+    pub fn new(input: &'a str) -> Preprocessor<'a> {
         Preprocessor {
             directive_processor: DirectiveProcessor::new(input),
             macro_processor: Default::default(),
+            text_output: Default::default(),
         }
     }
 
@@ -997,6 +479,30 @@ impl<'a> Preprocessor<'a> {
     /// Disabled by default; ordinary source values and `#line` expressions are unchanged.
     pub fn set_iris_conditions(&mut self, allow: bool) {
         self.directive_processor.iris_conditions = allow;
+    }
+
+    /// Retains source trivia, quotes and property punctuation for `next_text`.
+    /// Set this before adding defines or consuming input. The ordinary GLSL API is unchanged.
+    pub fn set_preserve_text(&mut self, preserve: bool) {
+        self.directive_processor.preserve_text = preserve;
+        self.directive_processor.lexer.set_preserve_text(preserve);
+    }
+
+    /// Reads one expanded fragment while retaining its source invocation line.
+    pub fn next_text(&mut self) -> Option<Result<text::TextToken, (PreprocessorError, Location)>> {
+        loop {
+            match self.step() {
+                Ok(token) => return Some(Ok(self.text_output.render(token))),
+                Err(StepExit::Error(error)) => return Some(Err(error)),
+                Err(StepExit::Finished) => return None,
+                Err(StepExit::Continue) => continue,
+            }
+        }
+    }
+
+    /// Reports whether a hash-prefixed line names a supported preprocessing directive.
+    pub fn is_directive(name: &str) -> bool {
+        directive::is_directive(name)
     }
 
     pub fn add_define(
@@ -1010,12 +516,18 @@ impl<'a> Preprocessor<'a> {
     fn step(&mut self) -> Step<Token> {
         let token = self.macro_processor.step(&mut self.directive_processor)?;
 
+        if token.opaque || token.trivia {
+            return Ok(token);
+        }
+
         // Is this token the start of a new macro?
         if let TokenValue::Ident(name) = &token.value {
             // Returns Continue if it started the define, token otherwise.
             if self.macro_processor.start_define_invocation(
                 name,
                 token.location,
+                token.output_location,
+                token.space,
                 &mut self.directive_processor,
             )? {
                 return Continue.into();
@@ -1026,7 +538,7 @@ impl<'a> Preprocessor<'a> {
     }
 }
 
-pub type PreprocessorItem = Result<Token, (PreprocessorError, Location)>;
+pub type PreprocessorItem = Result<crate::token::Token, (PreprocessorError, Location)>;
 
 impl<'a> Iterator for Preprocessor<'a> {
     type Item = PreprocessorItem;
@@ -1034,7 +546,7 @@ impl<'a> Iterator for Preprocessor<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self.step() {
-                Ok(token) => return Some(Ok(token)),
+                Ok(token) => return Some(Ok(token.into_public())),
                 Err(StepExit::Error(err)) => return Some(Err(err)),
                 Err(StepExit::Finished) => return None,
                 Err(StepExit::Continue) => continue,
