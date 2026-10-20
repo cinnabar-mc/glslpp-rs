@@ -6,6 +6,10 @@ use crate::token::{Location, Token as PublicToken, TokenValue};
 pub struct TextToken {
     pub text: String,
     pub line: u32,
+    /// Byte offset of the source invocation in the preprocessor input.
+    pub source_offset: u32,
+    /// Semantic tokens; comments and whitespace have no token value.
+    pub value: Option<TokenValue>,
 }
 
 /// A preprocessing token with the spelling needed by text consumers.
@@ -56,7 +60,7 @@ impl Output {
             .previous
             .as_ref()
             .is_some_and(|previous| token.space || joins_tokens(previous, &token.text));
-        self.previous = if token.trivia {
+        self.previous = if token.trivia || token.text.is_empty() {
             None
         } else {
             Some(token.text.clone())
@@ -68,6 +72,12 @@ impl Output {
                 token.text
             },
             line: token.output_location.line,
+            source_offset: token.output_location.start,
+            value: if token.trivia {
+                None
+            } else {
+                Some(token.value)
+            },
         }
     }
 }

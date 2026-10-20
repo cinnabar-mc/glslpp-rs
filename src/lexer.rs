@@ -314,9 +314,18 @@ pub struct Token {
 }
 
 pub type LexerItem = Result<Token, (PreprocessorError, Location)>;
+/// Chooses strict tokens, literal properties, or preserved GLSL source.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextMode {
+    Tokens,
+    Properties,
+    Glsl,
+}
+
 pub struct Lexer<'a> {
     source: &'a str,
-    preserve_text: bool,
+    mode: TextMode,
+    skipping: bool,
     inner: LexerCharIterator<'a>,
     leading_whitespace: bool,
     start_of_line: bool,
@@ -328,7 +337,8 @@ impl<'a> Lexer<'a> {
         // TODO bail out on source that is too large.
         Lexer {
             source: input,
-            preserve_text: false,
+            mode: TextMode::Tokens,
+            skipping: false,
             inner: LexerCharIterator::new(input),
             leading_whitespace: true,
             start_of_line: true,
@@ -336,11 +346,34 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Preserves trivia and opaque property literals instead of requiring GLSL tokens.
+    /// Preserves properties with their literal punctuation and physical continuations.
     pub(crate) fn set_preserve_text(&mut self, preserve: bool) {
-        self.preserve_text = preserve;
-        self.inner.inner.preserve_text = preserve;
-        self.inner.inner.inner.preserve_text = preserve;
+        self.set_text_mode(if preserve {
+            TextMode::Properties
+        } else {
+            TextMode::Tokens
+        });
+    }
+
+    /// Selects source preservation without changing GLSL splicing or token validation.
+    pub(crate) fn set_text_mode(&mut self, mode: TextMode) {
+        self.mode = mode;
+        self.inner.inner.inner.preserve_text = mode == TextMode::Properties;
+        self.set_skipping(self.skipping);
+    }
+
+    /// Reports the lexical policy used for environment macro definitions too.
+    pub(crate) fn text_mode(&self) -> TextMode {
+        self.mode
+    }
+
+    /// Makes skipped text opaque without allowing an unmatched quote to consume later lines.
+    pub(crate) fn set_skipping(&mut self, skipping: bool) {
+        self.skipping = skipping;
+        self.inner.inner.preserve_text = self.mode != TextMode::Tokens && !skipping;
+        if skipping {
+            self.inner.inner.quote = None;
+        }
     }
 
     pub fn had_comments(&self) -> bool {
@@ -609,7 +642,7 @@ impl<'a> Iterator for Lexer<'a> {
                     self.start_of_line = was_start_of_line;
                     self.leading_whitespace = true;
                     self.inner.next_char();
-                    if self.preserve_text {
+                    if self.mode != TextMode::Tokens {
                         Ok(TokenValue::Trivia)
                     } else {
                         continue;
@@ -622,7 +655,7 @@ impl<'a> Iterator for Lexer<'a> {
                     Ok(TokenValue::NewLine)
                 }
 
-                '\'' | '"' if self.preserve_text => {
+                '\'' | '"' if self.mode == TextMode::Properties && !self.skipping => {
                     let quote = self.inner.next_char().unwrap();
                     let mut escaped = false;
                     while let Some(c) = self.inner.next_char() {
@@ -657,7 +690,7 @@ impl<'a> Iterator for Lexer<'a> {
                     } else {
                         let saved = self.inner.clone();
                         match self.parse_punctuation() {
-                            Err(_) if self.preserve_text => {
+                            Err(_) if self.mode == TextMode::Properties || self.skipping => {
                                 self.inner = saved;
                                 self.inner.next_char();
                                 Ok(TokenValue::Opaque(String::new()))
@@ -668,13 +701,17 @@ impl<'a> Iterator for Lexer<'a> {
                 }
             };
 
-            location.end = if self.preserve_text {
+            location.end = if self.mode != TextMode::Tokens {
                 (self.inner.consumed_end as usize - self.inner.input_start as usize) as u32
             } else {
                 self.inner.get_last_consumed_end_offset() as u32
             };
-            let text = if self.preserve_text {
-                self.source[location.start as usize..location.end as usize].to_owned()
+            let text = if self.mode != TextMode::Tokens {
+                if self.mode == TextMode::Glsl {
+                    self.source[location.start as usize..location.end as usize].replace("\\\n", "")
+                } else {
+                    self.source[location.start as usize..location.end as usize].to_owned()
+                }
             } else {
                 String::new()
             };
@@ -682,7 +719,9 @@ impl<'a> Iterator for Lexer<'a> {
                 Ok(TokenValue::Opaque(ref value)) if value.is_empty() => {
                     Ok(TokenValue::Opaque(text.clone()))
                 }
-                Err(_) if self.preserve_text => Ok(TokenValue::Opaque(text.clone())),
+                Err(_) if self.mode == TextMode::Properties || self.skipping => {
+                    Ok(TokenValue::Opaque(text.clone()))
+                }
                 value => value,
             };
 
@@ -710,7 +749,7 @@ impl<'a> Iterator for Lexer<'a> {
                 },
                 leading_whitespace: self.leading_whitespace,
                 start_of_line: false,
-                text: if self.preserve_text {
+                text: if self.mode != TextMode::Tokens {
                     "\n".to_owned()
                 } else {
                     String::new()

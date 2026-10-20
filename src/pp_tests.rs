@@ -1675,3 +1675,56 @@ fn nested_expansion_errors_report_the_invocation_line() {
     };
     assert_eq!(error, (PreprocessorError::TooManyDefineArguments, 3));
 }
+
+#[test]
+fn inactive_groups_accept_nonconditional_payloads() {
+    for preserve in [false, true].iter().copied() {
+        for payload in [
+            "# error \"x\"",
+            "#error It's x",
+            "# error \"unclosed",
+            "#unknown @ ` $",
+            "unbalanced ' \" text",
+        ]
+        .iter()
+        {
+            let source = format!(
+                "#if 0\n{}\n#if @ invalid\n#error \"nested\n#endif\n#endif\n1\n",
+                payload
+            );
+            let mut pp = Preprocessor::new(&source);
+            pp.set_preserve_text(preserve);
+            let values: Vec<_> = pp
+                .map(|token| token.unwrap().value)
+                .filter_map(|value| match value {
+                    TokenValue::Integer(value) => Some(value.value),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(values, [1], "{}", payload);
+        }
+    }
+}
+
+#[test]
+fn preserved_glsl_keeps_active_directive_comments_and_splices() {
+    let source = "#version 450\n#define FLAG /* kept */\n#if 0 /* hidden */\n#error It's bad\n#else /* hidden too */\n#define VALUE 2 /* value */\n// ignored \\\n#error hidden\nint x = VALUE;\n#endif /* active */\n";
+    let mut pp = Preprocessor::new(source);
+    pp.set_preserve_glsl_text();
+    let mut comments = Vec::new();
+    let mut values = Vec::new();
+    while let Some(token) = pp.next_text() {
+        let token = token.unwrap();
+        if token.text.starts_with("/*") {
+            comments.push(token.text.clone());
+        }
+        if let Some(TokenValue::Integer(value)) = token.value {
+            values.push(value.value);
+        }
+    }
+    assert_eq!(comments, ["/* kept */", "/* value */", "/* active */"]);
+    assert_eq!(values, [2]);
+    let mut invalid = Preprocessor::new("float x = 'bad;\n");
+    invalid.set_preserve_glsl_text();
+    assert!(invalid.any(|token| token.is_err()));
+}

@@ -53,6 +53,7 @@ pub(super) struct DirectiveProcessor<'a> {
     had_non_directive_token: bool,
     pub(super) iris_conditions: bool,
     pub(super) preserve_text: bool,
+    comments: std::collections::VecDeque<Token>,
 }
 
 impl<'a> DirectiveProcessor<'a> {
@@ -69,11 +70,13 @@ impl<'a> DirectiveProcessor<'a> {
             had_non_directive_token: false,
             iris_conditions: false,
             preserve_text: false,
+            comments: Default::default(),
         }
     }
 
     /// Reads one lexical token, including preserved trivia.
     fn get_raw_lexer_token(&mut self) -> Step<LexerToken> {
+        self.lexer.set_skipping(self.skipping);
         match self.lexer.next() {
             None => Finished.into(),
             Some(Ok(mut tok)) => {
@@ -97,6 +100,9 @@ impl<'a> DirectiveProcessor<'a> {
             let token = self.get_raw_lexer_token()?;
             if token.value != LexerTokenValue::Trivia {
                 return Ok(token);
+            }
+            if self.lexer.text_mode() == lexer::TextMode::Glsl && token.text.starts_with('/') {
+                self.comments.push_back(convert_lexer_token_to_step(token)?);
             }
         }
     }
@@ -257,7 +263,7 @@ impl<'a> DirectiveProcessor<'a> {
 
         // Convert the content to tokens and add it to the define.
         let mut lexer = lexer::Lexer::new(content);
-        lexer.set_preserve_text(self.preserve_text);
+        lexer.set_text_mode(self.lexer.text_mode());
         loop {
             match lexer.next() {
                 Some(Ok(lexer_token)) => {
@@ -555,56 +561,104 @@ impl<'a> DirectiveProcessor<'a> {
         }
     }
 
+    /// Dispatches directives and keeps comments in their original conditional group.
     fn parse_directive(&mut self, hash_location: Location) -> Step<Token> {
+        let was_skipping = self.skipping;
         let token = self.expect_a_lexer_token(hash_location)?;
-
-        if let LexerTokenValue::Ident(ref directive) = token.value {
-            match DirectiveName::parse(directive) {
-                // TODO elif line
-                Some(DirectiveName::Error) => self.parse_error_directive(token.location)?,
-                Some(DirectiveName::Line) => self.parse_line_directive(token.location)?,
-
-                Some(DirectiveName::Define) => self.parse_define_directive(token.location)?,
-                Some(DirectiveName::Undef) => self.parse_undef_directive(token.location)?,
-
-                Some(DirectiveName::If) => self.parse_if_directive(token.location)?,
-                Some(DirectiveName::Ifdef) => self.parse_ifdef_directive(token.location)?,
-                Some(DirectiveName::Ifndef) => self.parse_ifndef_directive(token.location)?,
-                Some(DirectiveName::Elif) => self.parse_elif_directive(token.location)?,
-                Some(DirectiveName::Else) => self.parse_else_directive(token.location)?,
-                Some(DirectiveName::Endif) => self.parse_endif_directive(token.location)?,
-
-                Some(DirectiveName::Version) => {
-                    let result = self.parse_version_directive(token.location);
-                    self.had_directive = true;
-                    return result;
-                }
-                Some(DirectiveName::Extension) => {
-                    let result = self.parse_extension_directive(token.location);
-                    self.had_directive = true;
-                    return result;
-                }
-                Some(DirectiveName::Pragma) => {
-                    let result = self.parse_pragma_directive(token.location);
-                    self.had_directive = true;
-                    return result;
-                }
-                None => {
-                    if !self.skipping {
-                        return Err(StepExit::Error((
-                            PreprocessorError::UnknownDirective,
-                            token.location,
-                        )));
-                    }
-                }
+        let name = match &token.value {
+            LexerTokenValue::Ident(name) => DirectiveName::parse(name),
+            _ => None,
+        };
+        let opens_group = matches!(
+            name,
+            Some(DirectiveName::If | DirectiveName::Ifdef | DirectiveName::Ifndef)
+        );
+        let conditional = matches!(
+            name,
+            Some(
+                DirectiveName::If
+                    | DirectiveName::Ifdef
+                    | DirectiveName::Ifndef
+                    | DirectiveName::Elif
+                    | DirectiveName::Else
+                    | DirectiveName::Endif
+            )
+        );
+        let result = if was_skipping && !conditional {
+            if token.value == LexerTokenValue::NewLine {
+                Continue.into()
+            } else {
+                self.consume_until_newline().and(Continue.into())
             }
-            self.had_directive = true;
-            Continue.into()
-        } else if !self.skipping {
-            make_unexpected_error(token).into()
         } else {
-            Continue.into()
+            (|| {
+                if let LexerTokenValue::Ident(ref directive) = token.value {
+                    match DirectiveName::parse(directive) {
+                        // TODO elif line
+                        Some(DirectiveName::Error) => self.parse_error_directive(token.location)?,
+                        Some(DirectiveName::Line) => self.parse_line_directive(token.location)?,
+
+                        Some(DirectiveName::Define) => {
+                            self.parse_define_directive(token.location)?
+                        }
+                        Some(DirectiveName::Undef) => self.parse_undef_directive(token.location)?,
+
+                        Some(DirectiveName::If) => self.parse_if_directive(token.location)?,
+                        Some(DirectiveName::Ifdef) => self.parse_ifdef_directive(token.location)?,
+                        Some(DirectiveName::Ifndef) => {
+                            self.parse_ifndef_directive(token.location)?
+                        }
+                        Some(DirectiveName::Elif) => self.parse_elif_directive(token.location)?,
+                        Some(DirectiveName::Else) => self.parse_else_directive(token.location)?,
+                        Some(DirectiveName::Endif) => self.parse_endif_directive(token.location)?,
+
+                        Some(DirectiveName::Version) => {
+                            let result = self.parse_version_directive(token.location);
+                            self.had_directive = true;
+                            return result;
+                        }
+                        Some(DirectiveName::Extension) => {
+                            let result = self.parse_extension_directive(token.location);
+                            self.had_directive = true;
+                            return result;
+                        }
+                        Some(DirectiveName::Pragma) => {
+                            let result = self.parse_pragma_directive(token.location);
+                            self.had_directive = true;
+                            return result;
+                        }
+                        None => {
+                            if !self.skipping {
+                                return Err(StepExit::Error((
+                                    PreprocessorError::UnknownDirective,
+                                    token.location,
+                                )));
+                            }
+                        }
+                    }
+                    self.had_directive = true;
+                    Continue.into()
+                } else if !self.skipping {
+                    make_unexpected_error(token).into()
+                } else {
+                    Continue.into()
+                }
+            })()
+        };
+        let active = if opens_group {
+            !self.skipping
+        } else {
+            !was_skipping
+        };
+        if !active {
+            self.comments.clear();
+        } else if !self.comments.is_empty() {
+            let mut newline =
+                Token::generated(TokenValue::Ident(String::new()), hash_location, "\n".into());
+            newline.trivia = true;
+            self.comments.push_back(newline);
         }
+        result
     }
 }
 
@@ -615,7 +669,9 @@ impl<'a> MeLexer for DirectiveProcessor<'a> {
 
     fn step(&mut self) -> Step<Token> {
         let step = (|| {
-            // TODO: if we are skipping invalid characters should be allowed.
+            if let Some(comment) = self.comments.pop_front() {
+                return Ok(comment);
+            }
             let lexer_token = self.get_raw_lexer_token()?;
             match lexer_token.value {
                 LexerTokenValue::NewLine if self.preserve_text => {

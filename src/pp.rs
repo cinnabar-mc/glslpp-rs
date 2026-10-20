@@ -506,8 +506,6 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Enables Iris conditions: float values truncate toward zero, and `?:` selects a value.
-    /// Disabled by default; ordinary source values and `#line` expressions are unchanged.
     /// Caps the macro-processed tokens, in output and in conditions, before failing with
     /// `RecursionLimitReached`. Unlimited by default.
     pub fn set_work_limit(&mut self, tokens: u64) {
@@ -519,6 +517,7 @@ impl<'a> Preprocessor<'a> {
         self.directive_processor.work.get()
     }
 
+    /// Enables truncated float conditions and ternaries without changing source or `#line` values.
     pub fn set_iris_conditions(&mut self, allow: bool) {
         self.directive_processor.iris_conditions = allow;
     }
@@ -528,6 +527,14 @@ impl<'a> Preprocessor<'a> {
     pub fn set_preserve_text(&mut self, preserve: bool) {
         self.directive_processor.preserve_text = preserve;
         self.directive_processor.lexer.set_preserve_text(preserve);
+    }
+
+    /// Preserves GLSL comments and spelling while retaining line splicing and strict active tokens.
+    pub fn set_preserve_glsl_text(&mut self) {
+        self.directive_processor.preserve_text = true;
+        self.directive_processor
+            .lexer
+            .set_text_mode(lexer::TextMode::Glsl);
     }
 
     /// Sets original one-based line numbers for generated input lines before reading tokens.
