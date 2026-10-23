@@ -1728,3 +1728,33 @@ fn preserved_glsl_keeps_active_directive_comments_and_splices() {
     invalid.set_preserve_glsl_text();
     assert!(invalid.any(|token| token.is_err()));
 }
+
+#[test]
+fn iris_conditional_recovery_matches_jcpp() {
+    for (source, expected) in [
+        ("#define EMPTY\n#if EMPTY\nyes\n#else\nno\n#endif\n", "no"),
+        (
+            "#define ON\n#ifdef ON && OFF\nyes\n#else\nno\n#endif\n",
+            "yes",
+        ),
+        ("#ifdef\nfirst\nsecond\n#else\nno\n#endif\n", "second"),
+        ("#ifndef\nfirst\nsecond\n#else\nno\n#endif\n", "second"),
+        ("#if 0\n#ifdef\nno\n#endif\n#endif\nyes\n", "yes"),
+    ] {
+        let mut pp = Preprocessor::new(source);
+        pp.set_iris_conditions(true);
+        let tokens = pp.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(tokens.len(), 1, "{}", source);
+        assert!(
+            matches!(&tokens[0].value, TokenValue::Ident(name) if name == expected),
+            "{:?}",
+            tokens
+        );
+        assert!(
+            Preprocessor::new(source)
+                .collect::<Result<Vec<_>, _>>()
+                .is_err()
+                || source.starts_with("#if 0")
+        );
+    }
+}

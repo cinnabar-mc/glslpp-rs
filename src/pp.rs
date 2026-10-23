@@ -517,7 +517,8 @@ impl<'a> Preprocessor<'a> {
         self.directive_processor.work.get()
     }
 
-    /// Enables truncated float conditions and ternaries without changing source or `#line` values.
+    /// Enables Iris float conditions, ternaries, empty conditions and conditional-name recovery.
+    /// Source spelling and `#line` values are preserved.
     pub fn set_iris_conditions(&mut self, allow: bool) {
         self.directive_processor.iris_conditions = allow;
     }

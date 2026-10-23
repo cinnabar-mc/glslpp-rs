@@ -364,6 +364,9 @@ impl<'a> DirectiveProcessor<'a> {
             true,
             self.iris_conditions,
         );
+        if self.iris_conditions && parser.peek()?.is_none() {
+            return Ok(false);
+        }
         let res = parser.evaluate_expression()?;
 
         if let Some(token) = parser.peek()? {
@@ -383,19 +386,32 @@ impl<'a> DirectiveProcessor<'a> {
         })
     }
 
+    /// Reads one conditional macro name, with the recovery used by Iris's JCPP listener.
+    fn conditional_name(&mut self, location: Location, negated: bool) -> Step<bool> {
+        if !self.iris_conditions {
+            let (name, name_location) = self.expect_lexer_ident(location)?;
+            self.expect_lexer_token(LexerTokenValue::NewLine, name_location)?;
+            return Ok(self.defines.contains_key(&name) != negated);
+        }
+        let token = self.expect_a_lexer_token(location)?;
+        let result = match token.value {
+            LexerTokenValue::Ident(name) => self.defines.contains_key(&name) != negated,
+            _ => true,
+        };
+        // JCPP skips the rest of the physical line even when the missing name consumed NL.
+        self.consume_until_newline()?;
+        Ok(result)
+    }
+
     fn parse_ifdef_directive(&mut self, directive_location: Location) -> Step<()> {
         self.parse_if_like_directive(directive_location, |this, location| {
-            let (name, name_location) = this.expect_lexer_ident(location)?;
-            this.expect_lexer_token(LexerTokenValue::NewLine, name_location)?;
-            Ok(this.defines.contains_key(&name))
+            this.conditional_name(location, false)
         })
     }
 
     fn parse_ifndef_directive(&mut self, directive_location: Location) -> Step<()> {
         self.parse_if_like_directive(directive_location, |this, location| {
-            let (name, name_location) = this.expect_lexer_ident(location)?;
-            this.expect_lexer_token(LexerTokenValue::NewLine, name_location)?;
-            Ok(!this.defines.contains_key(&name))
+            this.conditional_name(location, true)
         })
     }
 
