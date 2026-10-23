@@ -914,6 +914,21 @@ fn parse_endif() {
 }
 
 #[test]
+fn iris_conditions_ignore_a_stray_endif() {
+    let source = "#if 1\nkept=1\n#endif\n#endif // stray\nafter=2\n#ifdef MISSING\nskipped=3\n#endif\n";
+    let mut pp = Preprocessor::new(source);
+    pp.set_preserve_text(true);
+    pp.set_iris_conditions(true);
+    let mut output = String::new();
+    while let Some(token) = pp.next_text() {
+        output.push_str(&token.unwrap().text);
+    }
+    assert!(output.contains("kept=1"), "{}", output);
+    assert!(output.contains("after=2"), "{}", output);
+    assert!(!output.contains("skipped"), "{}", output);
+}
+
+#[test]
 fn skipping_behavior() {
     // Check regular tokens are skipped
     check_preprocessed_result(

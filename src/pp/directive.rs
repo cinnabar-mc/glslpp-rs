@@ -454,10 +454,17 @@ impl<'a> DirectiveProcessor<'a> {
     }
 
     fn parse_endif_directive(&mut self, directive_location: Location) -> Step<()> {
-        let block = self.blocks.pop().ok_or(StepExit::Error((
-            PreprocessorError::EndifOutsideOfBlock,
-            directive_location,
-        )))?;
+        let Some(block) = self.blocks.pop() else {
+            // Iris's JCPP reports a stray `#endif` to its listener, keeps its root group and skips
+            // the rest of the line, so the text around it is preprocessed as if it were absent.
+            if self.iris_conditions {
+                return self.consume_until_newline();
+            }
+            return Err(StepExit::Error((
+                PreprocessorError::EndifOutsideOfBlock,
+                directive_location,
+            )));
+        };
 
         // After #endif we start processing tokens iff the block was not skipped.
         self.skipping = block.outer_skipped;
