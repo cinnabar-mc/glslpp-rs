@@ -52,6 +52,7 @@ pub(super) struct DirectiveProcessor<'a> {
     had_directive: bool,
     had_non_directive_token: bool,
     pub(super) iris_conditions: bool,
+    pub(super) iris_recovery: bool,
     pub(super) preserve_text: bool,
     comments: std::collections::VecDeque<Token>,
 }
@@ -69,6 +70,7 @@ impl<'a> DirectiveProcessor<'a> {
             had_directive: false,
             had_non_directive_token: false,
             iris_conditions: false,
+            iris_recovery: false,
             preserve_text: false,
             comments: Default::default(),
         }
@@ -364,7 +366,7 @@ impl<'a> DirectiveProcessor<'a> {
             true,
             self.iris_conditions,
         );
-        if self.iris_conditions && parser.peek()?.is_none() {
+        if self.iris_recovery && parser.peek()?.is_none() {
             return Ok(false);
         }
         let res = parser.evaluate_expression()?;
@@ -388,7 +390,7 @@ impl<'a> DirectiveProcessor<'a> {
 
     /// Reads one conditional macro name, with the recovery used by Iris's JCPP listener.
     fn conditional_name(&mut self, location: Location, negated: bool) -> Step<bool> {
-        if !self.iris_conditions {
+        if !self.iris_recovery {
             let (name, name_location) = self.expect_lexer_ident(location)?;
             self.expect_lexer_token(LexerTokenValue::NewLine, name_location)?;
             return Ok(self.defines.contains_key(&name) != negated);
@@ -715,7 +717,7 @@ impl<'a> MeLexer for DirectiveProcessor<'a> {
             }
         })();
 
-        if step == Err(StepExit::Finished) {
+        if step == Err(StepExit::Finished) && !self.iris_recovery {
             if let Some(block) = self.blocks.pop() {
                 return Err(StepExit::Error((
                     PreprocessorError::UnfinishedBlock,

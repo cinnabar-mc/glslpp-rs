@@ -1743,6 +1743,7 @@ fn iris_conditional_recovery_matches_jcpp() {
     ] {
         let mut pp = Preprocessor::new(source);
         pp.set_iris_conditions(true);
+        pp.set_iris_recovery(true);
         let tokens = pp.collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(tokens.len(), 1, "{}", source);
         assert!(
@@ -1756,5 +1757,29 @@ fn iris_conditional_recovery_matches_jcpp() {
                 .is_err()
                 || source.starts_with("#if 0")
         );
+    }
+}
+
+#[test]
+fn iris_recovery_accepts_unclosed_conditionals_only_when_requested() {
+    for (source, expected) in [
+        ("#if 1\nyes\n", Some("yes")),
+        ("#if 0\nno\n", None),
+        ("#ifdef\n// discarded\nyes\n", Some("yes")),
+    ] {
+        let mut pp = Preprocessor::new(source);
+        pp.set_iris_recovery(true);
+        let tokens = pp.collect::<Result<Vec<_>, _>>().unwrap();
+        let names = tokens
+            .iter()
+            .filter_map(|t| match t.value {
+                TokenValue::Ident(ref name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, expected.into_iter().collect::<Vec<_>>());
+        let mut strict = Preprocessor::new(source);
+        strict.set_iris_conditions(true);
+        assert!(strict.collect::<Result<Vec<_>, _>>().is_err());
     }
 }

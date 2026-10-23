@@ -517,10 +517,15 @@ impl<'a> Preprocessor<'a> {
         self.directive_processor.work.get()
     }
 
-    /// Enables Iris float conditions, ternaries, empty conditions and conditional-name recovery.
-    /// Source spelling and `#line` values are preserved.
+    /// Enables truncated float conditions and ternaries without changing source or `#line` values.
     pub fn set_iris_conditions(&mut self, allow: bool) {
         self.directive_processor.iris_conditions = allow;
+    }
+
+    /// Enables JCPP's conditional-directive and end-of-input recovery for Iris GLSL.
+    /// Keep this disabled when errors must remain observable, including properties parsing.
+    pub fn set_iris_recovery(&mut self, allow: bool) {
+        self.directive_processor.iris_recovery = allow;
     }
 
     /// Retains source trivia, quotes and property punctuation for `next_text`.
