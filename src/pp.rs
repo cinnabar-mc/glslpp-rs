@@ -514,7 +514,11 @@ impl MacroProcessor {
                         width: 32,
                     }),
                     token.location,
-                    value.to_string(),
+                    if lexer.text_mode() == lexer::TextMode::Glsl {
+                        format!("{}u", value)
+                    } else {
+                        value.to_string()
+                    },
                 );
                 generated.output_location = token.output_location;
                 generated.fragment = self.next_fragment();
@@ -574,6 +578,7 @@ impl<'a> Preprocessor<'a> {
 
     /// Retains source trivia, quotes and property punctuation for `next_text`.
     /// Macro replacements concatenate literally, with definition whitespace collapsed to spaces.
+    /// Consumed directives leave a newline in properties output.
     /// Set this before adding defines or consuming input. The ordinary GLSL API is unchanged.
     pub fn set_preserve_text(&mut self, preserve: bool) {
         self.directive_processor.preserve_text = preserve;

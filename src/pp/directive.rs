@@ -280,11 +280,30 @@ impl<'a> DirectiveProcessor<'a> {
         lexer.set_text_mode(self.lexer.text_mode());
         loop {
             match lexer.next() {
-                Some(Ok(lexer_token)) => {
+                Some(Ok(mut lexer_token)) => {
                     // Skip over newlines (the lexer always adds a newline, which would cause an
                     // error in convert_lexer_token).
                     if lexer_token.value == LexerTokenValue::NewLine {
                         continue;
+                    }
+
+                    // Reject malformed octal numbers supplied as environment replacements.
+                    let spelling = lexer_token.text.as_bytes();
+                    let digits = spelling.iter().take_while(|ch| ch.is_ascii_digit()).count();
+                    let number = &spelling[..digits];
+                    if self.lexer.text_mode() == lexer::TextMode::Properties
+                        && number.starts_with(b"0")
+                        && number.iter().any(|ch| matches!(ch, b'8' | b'9'))
+                        && !matches!(spelling.get(digits), Some(b'.' | b'e' | b'E'))
+                    {
+                        return Err((PreprocessorError::IntegerOverflow, lexer_token.location));
+                    }
+
+                    if self.lexer.text_mode() == lexer::TextMode::Glsl
+                        && lexer_token.value == LexerTokenValue::Trivia
+                        && lexer_token.text.starts_with('/')
+                    {
+                        lexer_token.text = " ".to_owned();
                     }
 
                     define.tokens.push(convert_lexer_token(lexer_token)?);
@@ -680,6 +699,12 @@ impl<'a> DirectiveProcessor<'a> {
         if !active {
             self.comments.clear();
         } else if !self.comments.is_empty() {
+            let mut newline =
+                Token::generated(TokenValue::Ident(String::new()), hash_location, "\n".into());
+            newline.trivia = true;
+            self.comments.push_back(newline);
+        }
+        if self.lexer.text_mode() == lexer::TextMode::Properties {
             let mut newline =
                 Token::generated(TokenValue::Ident(String::new()), hash_location, "\n".into());
             newline.trivia = true;

@@ -392,8 +392,9 @@ impl<'a> Lexer<'a> {
     /// Makes skipped text opaque without allowing an unmatched quote to consume later lines.
     pub(crate) fn set_skipping(&mut self, skipping: bool) {
         self.skipping = skipping;
-        self.inner.inner.preserve_text = self.mode != TextMode::Tokens && !skipping;
-        if skipping {
+        self.inner.inner.preserve_text =
+            self.mode == TextMode::Properties || (self.mode == TextMode::Glsl && !skipping);
+        if self.mode != TextMode::Properties && skipping {
             self.inner.inner.quote = None;
             self.inner.inner.escaped = false;
         }
@@ -458,6 +459,22 @@ impl<'a> Lexer<'a> {
             result.push(c);
         }
         result
+    }
+
+    /// Keeps numeric suffixes together in properties so macros cannot expand inside them.
+    fn parse_number_token(&mut self, first_char: char) -> Result<TokenValue, PreprocessorError> {
+        let value = self.parse_number(first_char);
+        if self.mode == TextMode::Properties
+            && self
+                .inner
+                .peek_char()
+                .is_some_and(|ch| ch.is_xid_continue())
+        {
+            self.consume_chars(|ch| ch.is_xid_continue());
+            Ok(TokenValue::Opaque(String::new()))
+        } else {
+            value
+        }
     }
 
     fn parse_number(&mut self, first_char: char) -> Result<TokenValue, PreprocessorError> {
@@ -678,14 +695,14 @@ impl<'a> Iterator for Lexer<'a> {
                     Ok(TokenValue::NewLine)
                 }
 
-                '\'' | '"' if self.mode == TextMode::Properties && !self.skipping => {
+                '\'' | '"' if self.mode == TextMode::Properties => {
                     self.inner.next_char();
                     while self.inner.next_quoted_char().is_some() {}
                     Ok(TokenValue::Opaque(String::new()))
                 }
                 c @ '0'..='9' => {
                     self.inner.next_char();
-                    self.parse_number(c)
+                    self.parse_number_token(c)
                 }
 
                 // Special case . as a punctuation because it can be the start of a float.
@@ -693,7 +710,7 @@ impl<'a> Iterator for Lexer<'a> {
                     self.inner.next_char();
 
                     match self.inner.peek_char() {
-                        Some('0'..='9') => self.parse_number('.'),
+                        Some('0'..='9') => self.parse_number_token('.'),
                         _ => Ok(TokenValue::Punct(Punct::Dot)),
                     }
                 }
@@ -734,6 +751,13 @@ impl<'a> Iterator for Lexer<'a> {
                 String::new()
             };
             let value = match value {
+                Ok(TokenValue::Trivia)
+                    if self.mode == TextMode::Properties
+                        && text.starts_with("/*")
+                        && (text.len() < 4 || !text.ends_with("*/")) =>
+                {
+                    Ok(TokenValue::Opaque(text.clone()))
+                }
                 Ok(TokenValue::Opaque(ref value)) if value.is_empty() => {
                     Ok(TokenValue::Opaque(text.clone()))
                 }
