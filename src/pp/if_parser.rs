@@ -139,19 +139,20 @@ impl<'macros> IfParser<'macros> {
 
     /// Helper method to consume the next token with define expansion
     fn next(&mut self) -> Step<Option<Token>> {
-        let token = match self.unexpanded_next()? {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-        Ok(match token.value {
-            TokenValue::Ident(ref name) if name != "defined" => {
-                match self.add_define(name, token.location)? {
-                    Some(t) => Some(t),
-                    None => self.next()?,
+        loop {
+            let token = match self.unexpanded_next()? {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            match token.value {
+                TokenValue::Ident(ref name) if name != "defined" => {
+                    if let Some(token) = self.add_define(name, token.location)? {
+                        return Ok(Some(token));
+                    }
                 }
+                _ => return Ok(Some(token)),
             }
-            _ => Some(token),
-        })
+        }
     }
 
     /// Helper method to get the next token with define expansion

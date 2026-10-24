@@ -142,13 +142,21 @@ impl<'a> DirectiveProcessor<'a> {
         }
     }
 
-    fn consume_until_newline(&mut self) -> Step<()> {
-        loop {
-            // TODO allow unexpected character errors because we are skipping.
-            if let LexerTokenValue::NewLine = self.get_lexer_token()?.value {
-                return Ok(());
+    /// Discards a directive tail tolerantly without changing conditional state.
+    fn skip_directive_tail(&mut self) {
+        self.lexer.set_skipping(true);
+        for token in self.lexer.by_ref() {
+            if matches!(
+                token,
+                Ok(LexerToken {
+                    value: LexerTokenValue::NewLine,
+                    ..
+                })
+            ) {
+                break;
             }
         }
+        self.lexer.set_skipping(self.skipping);
     }
 
     fn gather_until_newline(&mut self) -> Step<Vec<Token>> {
@@ -164,7 +172,8 @@ impl<'a> DirectiveProcessor<'a> {
 
     fn parse_define_directive(&mut self, directive_location: Location) -> Step<()> {
         if self.skipping {
-            return self.consume_until_newline();
+            self.skip_directive_tail();
+            return Ok(());
         }
 
         let (name, name_location) = self.expect_lexer_ident(directive_location)?;
@@ -323,7 +332,8 @@ impl<'a> DirectiveProcessor<'a> {
 
     fn parse_undef_directive(&mut self, directive_location: Location) -> Step<()> {
         if self.skipping {
-            return self.consume_until_newline();
+            self.skip_directive_tail();
+            return Ok(());
         }
 
         let (name, name_location) = self.expect_lexer_ident(directive_location)?;
@@ -337,7 +347,8 @@ impl<'a> DirectiveProcessor<'a> {
 
     fn parse_error_directive(&mut self, directive_location: Location) -> Step<()> {
         if self.skipping {
-            self.consume_until_newline()
+            self.skip_directive_tail();
+            Ok(())
         } else {
             // TODO consume the rest of the line and make a nice error message
             Err(StepExit::Error((
@@ -349,7 +360,8 @@ impl<'a> DirectiveProcessor<'a> {
 
     fn parse_line_directive(&mut self, directive_location: Location) -> Step<()> {
         if self.skipping {
-            return self.consume_until_newline();
+            self.skip_directive_tail();
+            return Ok(());
         }
 
         let line = self.gather_until_newline()?;
@@ -429,7 +441,7 @@ impl<'a> DirectiveProcessor<'a> {
             _ => true,
         };
         // JCPP skips the rest of the physical line even when the missing name consumed NL.
-        self.consume_until_newline()?;
+        self.skip_directive_tail();
         Ok(result)
     }
 
@@ -463,7 +475,8 @@ impl<'a> DirectiveProcessor<'a> {
 
         // The condition isn't parsed if it doesn't need to (and doesn't produce errors).
         if block.outer_skipped || block.had_valid_segment {
-            return self.consume_until_newline();
+            self.skip_directive_tail();
+            return Ok(());
         }
 
         let line = self.gather_until_newline()?;
@@ -509,7 +522,8 @@ impl<'a> DirectiveProcessor<'a> {
         self.skipping = block.outer_skipped;
 
         if self.skipping {
-            self.consume_until_newline()
+            self.skip_directive_tail();
+            Ok(())
         } else {
             self.expect_lexer_token(LexerTokenValue::NewLine, directive_location)?;
             Ok(())
@@ -528,7 +542,8 @@ impl<'a> DirectiveProcessor<'a> {
                 had_else: false,
                 outer_skipped: true,
             });
-            self.consume_until_newline()
+            self.skip_directive_tail();
+            Ok(())
         } else {
             let parsed = parse(self, directive_location);
             if !self.preserve_text {
@@ -549,7 +564,7 @@ impl<'a> DirectiveProcessor<'a> {
 
     fn parse_version_directive(&mut self, directive_location: Location) -> Step<Token> {
         if self.skipping {
-            self.consume_until_newline()?;
+            self.skip_directive_tail();
             Continue.into()
         } else {
             Ok(Token::generated(
@@ -570,7 +585,7 @@ impl<'a> DirectiveProcessor<'a> {
 
     fn parse_extension_directive(&mut self, directive_location: Location) -> Step<Token> {
         if self.skipping {
-            self.consume_until_newline()?;
+            self.skip_directive_tail();
             Continue.into()
         } else {
             Ok(Token::generated(
@@ -590,7 +605,7 @@ impl<'a> DirectiveProcessor<'a> {
 
     fn parse_pragma_directive(&mut self, directive_location: Location) -> Step<Token> {
         if self.skipping {
-            self.consume_until_newline()?;
+            self.skip_directive_tail();
             Continue.into()
         } else {
             Ok(Token::generated(
@@ -634,7 +649,8 @@ impl<'a> DirectiveProcessor<'a> {
             if token.value == LexerTokenValue::NewLine {
                 Continue.into()
             } else {
-                self.consume_until_newline().and(Continue.into())
+                self.skip_directive_tail();
+                Continue.into()
             }
         } else {
             (|| {

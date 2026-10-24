@@ -106,7 +106,7 @@ impl Iterator for SkipBackslashNewline<'_> {
             let mut peek_inner = self.inner.clone();
             if let Some(('\n', _)) = peek_inner.next() {
                 self.inner = peek_inner;
-                current = self.next()?;
+                current = self.inner.next()?;
             } else {
                 return Some(current);
             }
@@ -393,8 +393,7 @@ impl<'a> Lexer<'a> {
     /// Makes skipped text opaque without allowing an unmatched quote to consume later lines.
     pub(crate) fn set_skipping(&mut self, skipping: bool) {
         self.skipping = skipping;
-        self.inner.inner.preserve_text =
-            self.mode == TextMode::Properties || (self.mode == TextMode::Glsl && !skipping);
+        self.inner.inner.preserve_text = self.mode != TextMode::Tokens || skipping;
         if self.mode != TextMode::Properties && skipping {
             self.inner.inner.quote = None;
             self.inner.inner.escaped = false;
@@ -677,7 +676,7 @@ impl Iterator for Lexer<'_> {
                     Ok(TokenValue::NewLine)
                 }
 
-                '\'' | '"' if self.mode == TextMode::Properties => {
+                '\'' | '"' if self.mode == TextMode::Properties || self.skipping => {
                     self.inner.next_char();
                     while self.inner.next_quoted_char().is_some() {}
                     Ok(TokenValue::Opaque(String::new()))

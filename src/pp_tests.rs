@@ -9,6 +9,239 @@ use alloc::{
     vec,
 };
 
+extern crate std;
+
+/// Runs stack-safety regressions below the test harness's default thread stack size.
+fn on_small_stack(test: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(test)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// Selects a lexical mode before the first source token is consumed.
+fn preprocessor_in_mode(source: &str, mode: lexer::TextMode) -> Preprocessor<'_> {
+    let mut pp = Preprocessor::new(source);
+    match mode {
+        lexer::TextMode::Tokens => {}
+        lexer::TextMode::Glsl => pp.set_preserve_glsl_text(),
+        lexer::TextMode::Properties => pp.set_preserve_text(true),
+    }
+    pp
+}
+
+/// Collects semantic values without including preserved trivia in any mode.
+fn semantic_values(pp: &mut Preprocessor<'_>) -> Vec<TokenValue> {
+    let mut values = Vec::new();
+    while let Some(token) = pp.next_text() {
+        values.extend(token.unwrap().value);
+    }
+    values
+}
+
+#[test]
+fn flat_conditions_and_empty_expansions_use_bounded_stack() {
+    on_small_stack(|| {
+        for mode in [
+            lexer::TextMode::Tokens,
+            lexer::TextMode::Glsl,
+            lexer::TextMode::Properties,
+        ] {
+            for iris in [false, true] {
+                for expression in [
+                    format!("{}1", "E ".repeat(100_000)),
+                    format!("1{}", " + 0".repeat(50_000)),
+                ] {
+                    let source = format!("#define E\n#if {expression}\nyes\n#endif\n");
+                    let mut pp = preprocessor_in_mode(&source, mode);
+                    pp.set_iris_conditions(iris);
+                    pp.set_work_limit(1_000_000);
+                    assert_eq!(semantic_values(&mut pp), [TokenValue::Ident("yes".into())]);
+                    assert!(pp.work_remaining() > 0);
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn macro_chains_and_flat_arguments_use_bounded_stack() {
+    on_small_stack(|| {
+        let mut source = String::from("#define M0 1\n#define F0(x) x\n#define ID(x) x\n");
+        for level in 1..=100_000 {
+            source += &format!(
+                "#define M{level} M{p}\n#define F{level}(x) F{p}(x)\n",
+                p = level - 1
+            );
+        }
+        source += "#if M100000\nF100000(yes)\n#endif\nID(";
+        source += &"token ".repeat(100_000);
+        source += ")\n";
+        for mode in [
+            lexer::TextMode::Tokens,
+            lexer::TextMode::Glsl,
+            lexer::TextMode::Properties,
+        ] {
+            let mut pp = preprocessor_in_mode(&source, mode);
+            let values = semantic_values(&mut pp);
+            assert_eq!(values.len(), 100_001);
+            assert_eq!(values[0], TokenValue::Ident("yes".into()));
+            assert!(values[1..]
+                .iter()
+                .all(|value| value == &TokenValue::Ident("token".into())));
+        }
+    });
+}
+
+#[test]
+fn long_directive_runs_and_discarded_tails_use_bounded_stack() {
+    on_small_stack(|| {
+        let source = format!(
+            "{}#if 0\n{}{}#endif\n{}yes\n",
+            "#define E\n".repeat(100_000),
+            "#unknown @ ' \"\n".repeat(100_000),
+            "#if invalid\n".repeat(100_000),
+            "#endif\n".repeat(100_000),
+        );
+        let tail = format!("#ifdef ON {}\nyes\n#endif\nafter\n", "@ ".repeat(100_000));
+        for mode in [
+            lexer::TextMode::Tokens,
+            lexer::TextMode::Glsl,
+            lexer::TextMode::Properties,
+        ] {
+            let mut pp = preprocessor_in_mode(&source, mode);
+            assert_eq!(semantic_values(&mut pp), [TokenValue::Ident("yes".into())]);
+            let mut pp = preprocessor_in_mode(&tail, mode);
+            pp.set_iris_recovery(true);
+            pp.add_define("ON", "").unwrap();
+            assert_eq!(
+                semantic_values(&mut pp),
+                [
+                    TokenValue::Ident("yes".into()),
+                    TokenValue::Ident("after".into())
+                ]
+            );
+        }
+    });
+}
+
+#[test]
+fn recursive_macro_arguments_have_an_explicit_depth_limit() {
+    on_small_stack(|| {
+        let source = format!(
+            "#define ID(x) x\n{}yes{}\n",
+            "ID(".repeat(256),
+            ")".repeat(256)
+        );
+        for mode in [
+            lexer::TextMode::Tokens,
+            lexer::TextMode::Glsl,
+            lexer::TextMode::Properties,
+        ] {
+            let mut pp = preprocessor_in_mode(&source, mode);
+            assert!(
+                pp.any(|item| matches!(item, Err((PreprocessorError::RecursionLimitReached, _))))
+            );
+        }
+    });
+}
+
+#[test]
+fn recovered_conditional_tails_are_opaque_and_restore_branch_state() {
+    for mode in [
+        lexer::TextMode::Tokens,
+        lexer::TextMode::Glsl,
+        lexer::TextMode::Properties,
+    ] {
+        for directive in ["ifdef", "ifndef"] {
+            for tail in [
+                "\"ignored\"",
+                "'x'",
+                "@ ` $",
+                "\"unterminated",
+                "'unterminated",
+                "\"/*\"",
+                "'/*'",
+                "\"//\"",
+                "'//'",
+                "\"#endif\"",
+                "/* comment */ @",
+            ] {
+                for (operand, expected) in [
+                    ("ON ", if directive == "ifdef" { "yes" } else { "no" }),
+                    ("OFF ", if directive == "ifndef" { "yes" } else { "no" }),
+                    ("\n", "yes"),
+                    ("1 ", "yes"),
+                ] {
+                    let source = format!(
+                        "#define ON\n#{directive} {operand}{tail}\nyes\n#else\nno\n#endif\nafter\n"
+                    );
+                    let mut pp = preprocessor_in_mode(&source, mode);
+                    pp.set_iris_recovery(true);
+                    assert_eq!(
+                        semantic_values(&mut pp),
+                        [
+                            TokenValue::Ident(expected.into()),
+                            TokenValue::Ident("after".into())
+                        ],
+                        "{source}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn discarded_directive_tails_share_tolerant_skipping() {
+    for mode in [
+        lexer::TextMode::Tokens,
+        lexer::TextMode::Glsl,
+        lexer::TextMode::Properties,
+    ] {
+        for tail in [
+            "\"ignored\"",
+            "'x'",
+            "@ ` $",
+            "\"/*\"",
+            "'/*'",
+            "\"unclosed",
+        ] {
+            let sources = [
+                format!(
+                    "#if 0\n#define {tail}\n#undef {tail}\n#error {tail}\n#line {tail}\n\
+                     #version {tail}\n#extension {tail}\n#pragma {tail}\n#unknown {tail}\n\
+                     #123 {tail}\n#\n#if {tail}\n#endif\n#elif 1\nyes\n#endif\nafter\n"
+                ),
+                format!("#if 1\nyes\n#elif {tail}\nno\n#endif\nafter\n"),
+                format!("#if 0\n#if 0\n#endif {tail}\n#else\nyes\n#endif\nafter\n"),
+            ];
+            for source in sources {
+                let mut pp = preprocessor_in_mode(&source, mode);
+                assert_eq!(
+                    semantic_values(&mut pp),
+                    [
+                        TokenValue::Ident("yes".into()),
+                        TokenValue::Ident("after".into())
+                    ],
+                    "{source}"
+                );
+            }
+        }
+        for source in [
+            "#define ON\n#ifdef ON @",
+            "#ifndef OFF 'x'",
+            "#ifdef\n\"ignored\"",
+        ] {
+            let mut pp = preprocessor_in_mode(source, mode);
+            pp.set_iris_recovery(true);
+            assert!(semantic_values(&mut pp).is_empty());
+        }
+    }
+}
+
 /// Collects rendered text and semantic values from either preservation mode.
 fn preserved_output(source: &str, glsl: bool) -> (String, Vec<TokenValue>) {
     let mut pp = Preprocessor::new(source);

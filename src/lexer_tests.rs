@@ -138,6 +138,39 @@ fn skip_backslash_newline() {
 }
 
 #[test]
+fn flat_lexer_skipping_uses_bounded_stack() {
+    extern crate std;
+    std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(|| {
+            let input = alloc::format!("{}token", "\\\n".repeat(100_000));
+            let mut chars = SkipBackslashNewline::new(&input);
+            assert_eq!(chars.next(), c('t', 100_001));
+            assert_eq!(chars.count(), 4);
+            assert_eq!(lexed_token_values(&input), [make_ident("token")]);
+
+            let input = alloc::format!("// {}\ntoken", "\\\n".repeat(100_000));
+            assert_eq!(
+                lexed_token_values(&input),
+                [TokenValue::NewLine, make_ident("token")]
+            );
+
+            let input = alloc::format!("{}{}", " ".repeat(100_000), "token ".repeat(100_000));
+            assert_eq!(Lexer::new(&input).count(), 100_001);
+
+            // A splice must not remove the backslash-newline pair it creates.
+            let input = "\\\\\n\n";
+            assert_eq!(
+                SkipBackslashNewline::new(input).collect::<Vec<_>>(),
+                [('\\', 1), ('\n', 2)]
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn replace_comments() {
     // Test a slash that's not a comment
     let mut it = ReplaceComments::new("a/b");

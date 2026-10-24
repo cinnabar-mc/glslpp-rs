@@ -89,6 +89,9 @@ fn charge_work(work: &Cell<u64>, location: Location) -> Step<()> {
 /// Tokens one fully expanded macro argument may hold; nested arguments otherwise grow without bound.
 const MAX_EXPANDED_ARGUMENT_TOKENS: usize = 1 << 20;
 
+/// Bounds recursive argument expansion and its chained lexer lookups.
+const MAX_MACRO_ARGUMENT_DEPTH: usize = 32;
+
 fn make_unexpected_error(token: LexerToken) -> StepExit {
     let error = match token.value {
         LexerTokenValue::Integer(i) => PreprocessorError::UnexpectedToken(TokenValue::Integer(i)),
@@ -166,6 +169,7 @@ struct MacroProcessor {
 
     peeked: VecDeque<Step<Token>>,
     define_line: u32,
+    argument_depth: usize,
 }
 
 impl MacroProcessor {
@@ -352,6 +356,16 @@ impl MacroProcessor {
     }
 
     fn expand_parameter(&self, lexer: &mut dyn MeLexer, parameter: Vec<Token>) -> Step<Vec<Token>> {
+        if self.argument_depth >= MAX_MACRO_ARGUMENT_DEPTH {
+            return Err(StepExit::Error((
+                PreprocessorError::RecursionLimitReached,
+                parameter
+                    .first()
+                    .map(|token| token.location)
+                    .unwrap_or_default(),
+            )));
+        }
+
         struct ExpandParameterLexer<'a> {
             parent_lexer: &'a dyn MeLexer,
             expander: &'a MacroProcessor,
@@ -400,7 +414,10 @@ impl MacroProcessor {
             position: 0,
         };
 
-        let mut processor = MacroProcessor::default();
+        let mut processor = MacroProcessor {
+            argument_depth: self.argument_depth + 1,
+            ..Default::default()
+        };
         let mut expanded_parameters = Default::default();
         loop {
             match processor.step(&mut parameter_lexer) {
