@@ -555,7 +555,8 @@ impl<'a> Preprocessor<'a> {
         self.directive_processor.work.get()
     }
 
-    /// Enables truncated float conditions and ternaries without changing source or `#line` values.
+    /// Enables JCPP condition numbers and ternaries without changing source or `#line` values.
+    /// Fractions are discarded before exponent scaling, and integer parts must fit in i64.
     pub fn set_iris_conditions(&mut self, allow: bool) {
         self.directive_processor.iris_conditions = allow;
     }

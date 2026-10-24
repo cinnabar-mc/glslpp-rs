@@ -49,7 +49,8 @@ fn assert_preserved_tokens(source: &str) {
         .collect();
     let (text, values) = preserved_output(source, true);
     assert_eq!(values, expected, "{}", source);
-    let lexed_values: Vec<_> = NoopPreprocessor::new(&text)
+    let downstream = crate::differential_tests::downstream_glsl(&text);
+    let lexed_values: Vec<_> = NoopPreprocessor::new(&downstream)
         .map(|token| {
             token
                 .unwrap_or_else(|error| panic!("strict lexer: {:?}, output: {:?}", error, text))
@@ -329,6 +330,96 @@ fn preserved_line_macros_match_token_mode() {
         assert_eq!(preserved_output(source, glsl).1, expected);
     }
     assert_preserved_tokens("#line 37\n__LINE__;\n");
+}
+
+#[test]
+fn preserved_line_comments_cannot_splice_again_downstream() {
+    for newline in ["\n", "\r", "\r\n", "\n\r"] {
+        for count in 1..=4 {
+            for tail in ["\n", "\n\n", "continued\n", "\\\n\n"] {
+                let source = format!(
+                    "// comment {}{}{}int visible;\n",
+                    "\\".repeat(count),
+                    newline,
+                    tail
+                );
+                assert_preserved_tokens(&source);
+            }
+        }
+    }
+}
+
+#[test]
+fn iris_condition_literals_do_not_round_through_glsl_floats() {
+    for (literal, expected) in [
+        ("0.99999999", "0"),
+        ("1.999999999999999999", "1"),
+        ("16777217.0", "16777217"),
+        ("-0.999999999999999999", "0"),
+        ("0.999e2", "0"),
+        (".5e3", "0"),
+        ("1.5e2", "100"),
+        ("010.5", "10"),
+        ("1e999", "9223372036854775807"),
+        ("0e999", "0"),
+        ("1e-999", "0"),
+        ("9223372036854775807.999", "9223372036854775807"),
+        ("9007199254740993e0", "9007199254740992"),
+        ("0x7fffffffffffffff", "9223372036854775807"),
+        ("0777777777777777777777", "9223372036854775807"),
+        ("1.99999999L", "1"),
+    ] {
+        for directive in ["if", "elif"] {
+            let prefix = if directive == "elif" { "#if 0\n" } else { "" };
+            let source = format!(
+                "{}#{} {} == {}\n7\n#else\n9\n#endif\n",
+                prefix, directive, literal, expected
+            );
+            for mode in [0, 1, 2] {
+                let mut pp = Preprocessor::new(&source);
+                if mode == 1 {
+                    pp.set_preserve_text(true);
+                }
+                if mode == 2 {
+                    pp.set_preserve_glsl_text();
+                }
+                pp.set_iris_conditions(true);
+                let mut values = Vec::new();
+                if mode == 0 {
+                    values.extend(pp.map(|token| token.unwrap().value));
+                } else {
+                    while let Some(token) = pp.next_text() {
+                        values.extend(token.unwrap().value);
+                    }
+                }
+                assert_eq!(values, preprocessed_values("7"), "{}", source);
+            }
+        }
+    }
+}
+
+#[test]
+fn iris_condition_literals_reject_integer_and_exponent_overflow() {
+    for literal in [
+        "9223372036854775808",
+        "18446744073709551616",
+        "0x8000000000000000",
+        "999999999999999999999999999999.9",
+        "1e2147483648",
+        "1e-2147483649",
+    ] {
+        for directive in ["if", "elif"] {
+            let prefix = if directive == "elif" { "#if 0\n" } else { "" };
+            let source = format!("{}#{} {}\n7\n#endif\n", prefix, directive, literal);
+            let mut pp = Preprocessor::new(&source);
+            pp.set_iris_conditions(true);
+            assert!(
+                pp.any(|item| matches!(item, Err((PreprocessorError::IntegerOverflow, _)))),
+                "{}",
+                source
+            );
+        }
+    }
 }
 
 #[test]

@@ -1,7 +1,8 @@
-use crate::token::{parse_float, parse_integer, PreprocessorError, Punct};
+use crate::token::{parse_integer, PreprocessorError, Punct};
 
 use super::{Define, Location, MacroProcessor, MeLexer, Step, StepExit, Token, TokenValue};
 use alloc::borrow::ToOwned;
+use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::{self, Vec};
@@ -10,6 +11,60 @@ use hashbrown::HashMap;
 
 /// Maximum recursive expression nesting before returning an error.
 const MAX_EXPRESSION_DEPTH: usize = 64;
+
+/// Converts a condition literal using JCPP's signed integer part and exponent scaling.
+/// Fractions and type suffixes do not affect the value. Integer parts must fit in i64.
+fn iris_number(number: &str, float: bool) -> Result<i64, PreprocessorError> {
+    let number = if float {
+        number.trim_end_matches(['l', 'L', 'f', 'F'])
+    } else {
+        number.trim_end_matches(['u', 'U', 'l', 'L'])
+    };
+    if !float {
+        let (digits, radix) = if number.starts_with("0x") || number.starts_with("0X") {
+            (&number[2..], 16)
+        } else if number.starts_with('0') {
+            (number, 8)
+        } else {
+            (number, 10)
+        };
+        return i64::from_str_radix(digits, radix).map_err(|_| PreprocessorError::IntegerOverflow);
+    }
+
+    let (mantissa, exponent) = match number.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            Some(
+                exponent
+                    .parse::<i32>()
+                    .map_err(|_| PreprocessorError::IntegerOverflow)?,
+            ),
+        ),
+        None => (number, None),
+    };
+    let integer = mantissa.split('.').next().unwrap_or_default();
+    let value = if integer.is_empty() {
+        0
+    } else {
+        integer
+            .parse::<i64>()
+            .map_err(|_| PreprocessorError::IntegerOverflow)?
+    };
+    let Some(exponent) = exponent else {
+        return Ok(value);
+    };
+    // Outside this range every nonzero signed integer either saturates or truncates to zero.
+    if value == 0 || exponent < -18 {
+        return Ok(0);
+    }
+    if exponent > 18 {
+        return Ok(i64::MAX);
+    }
+    let scale = format!("1e{}", exponent)
+        .parse::<f64>()
+        .map_err(|_| PreprocessorError::FloatParsingError)?;
+    Ok((value as f64 * scale) as i64)
+}
 
 struct IfLexer<'macros> {
     tokens: vec::IntoIter<Token>,
@@ -200,10 +255,13 @@ impl<'macros> IfParser<'macros> {
 
                 self.handle_defined()
             }
+            TokenValue::Integer(ref number) | TokenValue::Float(ref number)
+                if self.iris_conditions =>
+            {
+                iris_number(number, matches!(token.value, TokenValue::Float(_)))
+                    .map_err(|error| StepExit::Error((error, token.location)))
+            }
             TokenValue::Integer(int) => parse_integer(&int)
-                .map(|value| value.value as i64)
-                .map_err(|error| StepExit::Error((error, token.location))),
-            TokenValue::Float(float) if self.iris_conditions => parse_float(&float)
                 .map(|value| value.value as i64)
                 .map_err(|error| StepExit::Error((error, token.location))),
             TokenValue::Punct(Punct::LeftParen) => {

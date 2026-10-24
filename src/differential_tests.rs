@@ -48,6 +48,35 @@ fn preprocess(
     (text, Ok(values))
 }
 
+/// Applies downstream newline normalization and one nonrecursive line-splicing pass.
+pub(super) fn downstream_glsl(source: &str) -> String {
+    let mut input = source.chars().peekable();
+    let mut normalized = String::new();
+    while let Some(ch) = input.next() {
+        if matches!(ch, '\r' | '\n') {
+            if input
+                .peek()
+                .is_some_and(|next| matches!((ch, *next), ('\r', '\n') | ('\n', '\r')))
+            {
+                input.next();
+            }
+            normalized.push('\n');
+        } else {
+            normalized.push(ch);
+        }
+    }
+    let mut chars = normalized.chars().peekable();
+    let mut result = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && chars.peek() == Some(&'\n') {
+            chars.next();
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 /// Compares rendered text with strict lexing and metadata with the ordinary token API.
 fn check_glsl(source: &str, environment: &str) {
     let (_, expected) = preprocess(source, environment, false);
@@ -67,7 +96,8 @@ fn check_glsl(source: &str, environment: &str) {
                 )
             })
             .collect();
-        let actual: Vec<_> = Lexer::new(&text)
+        let downstream = downstream_glsl(&text);
+        let actual: Vec<_> = Lexer::new(&downstream)
             .filter_map(|token| {
                 let token = token.unwrap_or_else(|error| panic!("{:?}: {:?}", text, error));
                 if token.value == LexicalValue::NewLine {
@@ -89,7 +119,11 @@ fn check_glsl(source: &str, environment: &str) {
 fn generated_glsl_matches_strict_tokens_and_directive_metadata() {
     let mut state = 0x474c_534c_2026_0006;
     for _ in 0..100_000 {
-        let prefix = choose(&mut state, &["", "/*before*/", "//before\n", "\t"]);
+        let slashes = choose(&mut state, &["\\", "\\\\", "\\\\\\", "\\\\\\\\"]);
+        let following = choose(&mut state, &["\n", "\n\n", "continued\n", "\\\n\n"]);
+        let comment = format!("//before{}\n{}int visible;\n", slashes, following);
+        let prefixes = ["", "/*before*/", &comment, "\t"];
+        let prefix = choose(&mut state, &prefixes);
         let metadata = choose(
             &mut state,
             &[

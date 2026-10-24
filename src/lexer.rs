@@ -708,7 +708,7 @@ impl Iterator for Lexer<'_> {
             } else {
                 self.inner.get_last_consumed_end_offset() as u32
             };
-            let text = if self.mode != TextMode::Tokens {
+            let mut text: String = if self.mode != TextMode::Tokens {
                 if self.mode == TextMode::Glsl {
                     SkipBackslashNewline::new(
                         &self.source[location.start as usize..location.end as usize],
@@ -721,6 +721,10 @@ impl Iterator for Lexer<'_> {
             } else {
                 String::new()
             };
+            // A second compiler pass must not splice the newline ending this comment.
+            if self.mode == TextMode::Glsl && text.starts_with("//") && text.ends_with('\\') {
+                text.push(' ');
+            }
             let value = match value {
                 Ok(TokenValue::Trivia)
                     if self.mode == TextMode::Properties
