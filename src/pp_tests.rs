@@ -43,14 +43,18 @@ fn assert_preserved_tokens(source: &str) {
     for glsl in [false, true] {
         let (text, values) = preserved_output(source, glsl);
         assert_eq!(values, expected, "{}", source);
-        let lexed_values: Vec<_> = NoopPreprocessor::new(&text)
-            .map(|token| {
-                token
-                    .unwrap_or_else(|error| panic!("strict lexer: {:?}, output: {:?}", error, text))
-                    .value
-            })
-            .collect();
-        assert_eq!(lexed_values, rendered_values, "{}", text);
+        if glsl {
+            let lexed_values: Vec<_> = NoopPreprocessor::new(&text)
+                .map(|token| {
+                    token
+                        .unwrap_or_else(|error| {
+                            panic!("strict lexer: {:?}, output: {:?}", error, text)
+                        })
+                        .value
+                })
+                .collect();
+            assert_eq!(lexed_values, rendered_values, "{}", text);
+        }
     }
 }
 
@@ -152,18 +156,90 @@ fn preserved_adjacent_token_pairs_match_strict_lexing() {
 
 #[test]
 fn preserved_spacing_keeps_source_and_separates_expansions() {
+    for (source, properties, glsl) in [
+        (
+            "foo[1]+=2;/*keep*/bar++;\n",
+            "foo[1]+=2;/*keep*/bar++;\n",
+            "foo[1]+=2;/*keep*/bar++;\n",
+        ),
+        (
+            "#define ADD(x) x+1\nfoo=ADD(2);\n",
+            "foo=2+1;\n",
+            "foo=2+1;\n",
+        ),
+        ("#define F(x) x\nF(1+2);\n", "1+2;\n", "1+2;\n"),
+        (
+            "#define N() 1\nN()\t/*keep*/L;\n",
+            "1\t/*keep*/L;\n",
+            "1\t/*keep*/L;\n",
+        ),
+        ("#define N() 1\nN()/**/L;\n", "1/**/L;\n", "1/**/L;\n"),
+        ("#define VOID()\n+VOID()+;\n", "++;\n", "+ +;\n"),
+        ("line=__LINE__;\n", "line=1;\n", "line=1;\n"),
+    ] {
+        assert_eq!(preserved_output(source, false).0, properties, "{}", source);
+        assert_eq!(preserved_output(source, true).0, glsl, "{}", source);
+    }
+}
+
+#[test]
+fn properties_macro_values_keep_literal_spelling() {
+    let source = "#define NEG -1\n#define PATH textures/foo.png\n#define NUM 0.50\n#define VALUE(x) x\n#define FILE(x) textures/x.png\n#define SUM(a,b) a + b\n#define WRAP(x) [ x ]\n#define JOIN(a,b) a b\n#define EMPTY\n#define SPACED a  \t b\nalphaTest.foo=GREATER NEG\ntexture.foo=PATH\ntexture.joint=PATH.png\nnumber=NUM\nnumber.joint=VALUE(1).0\nfunction=VALUE( NEG )\nfile=FILE(foo)\nsum=SUM(1,  2)\nnested=WRAP(VALUE(NEG))\nspaced=SPACED\nempty=JOIN(,foo)EMPTY\nsource=hello  \tworld\n";
+    assert_eq!(
+        preserved_output(source, false).0,
+        "alphaTest.foo=GREATER -1\ntexture.foo=textures/foo.png\ntexture.joint=textures/foo.png.png\nnumber=0.50\nnumber.joint=1.0\nfunction=-1\nfile=textures/foo.png\nsum=1 + 2\nnested=[ -1 ]\nspaced=a b\nempty= foo\nsource=hello  \tworld\n"
+    );
+}
+
+#[test]
+fn properties_macro_joints_and_arguments_follow_literal_concatenation() {
+    let source = "#define X() foo\n#define N() 1\n#define D /\n#define EMPTY\n#define ID(x) x\n#define B(x) <x>\nname=X()bar\nnumber=N()L\ncomment=D/*x*/2\njoint=/EMPTY*2\narg=ID(a  \t b)\nempty=B()\ngroups=ID(a ( b , c ) )\n";
+    assert_eq!(
+        preserved_output(source, false).0,
+        "name=foobar\nnumber=1L\ncomment=//*x*/2\njoint=/*2\narg=a b\nempty=<>\ngroups=a( b, c)\n"
+    );
+}
+
+#[test]
+fn environment_macros_preserve_supplied_whitespace() {
     for glsl in [false, true] {
-        for (source, expected) in [
-            ("foo[1]+=2;/*keep*/bar++;\n", "foo[1]+=2;/*keep*/bar++;\n"),
-            ("#define ADD(x) x+1\nfoo=ADD(2);\n", "foo= 2 + 1 ;\n"),
-            ("#define F(x) x\nF(1+2);\n", "1 + 2 ;\n"),
-            ("#define N() 1\nN()\t/*keep*/L;\n", "1\t/*keep*/L;\n"),
-            ("#define N() 1\nN()/**/L;\n", "1 /**/L;\n"),
-            ("#define VOID()\n+VOID()+;\n", "+ +;\n"),
-            ("line=__LINE__;\n", "line= 1 ;\n"),
-        ] {
-            assert_eq!(preserved_output(source, glsl).0, expected, "{}", source);
+        let mut pp = Preprocessor::new("value=ENV\n#define ID(x) x\nnested=ID(ENV)\n");
+        if glsl {
+            pp.set_preserve_glsl_text();
+        } else {
+            pp.set_preserve_text(true);
         }
+        pp.add_define("ENV", " -1  \tfoo ").unwrap();
+        let mut text = String::new();
+        while let Some(token) = pp.next_text() {
+            text.push_str(&token.unwrap().text);
+        }
+        assert_eq!(
+            text,
+            if glsl {
+                "value= -1  \tfoo \nnested=-1  \tfoo\n"
+            } else {
+                "value= -1  \tfoo \nnested=-1 foo\n"
+            }
+        );
+    }
+}
+
+#[test]
+fn glsl_replacements_keep_internal_spacing_and_safe_joints() {
+    for (source, expected) in [
+        ("#define NEG -1\nvalue=NEG;\n", "value=-1;\n"),
+        (
+            "#define ADD(x) x  +\t1\nvalue=ADD(2);\n",
+            "value=2  +\t1;\n",
+        ),
+        ("#define N() 1\nN()+2;\n", "1+2;\n"),
+        ("#define N() 1\nN()L;\n", "1 L;\n"),
+        ("#define DIV /\n4 DIV/*c*/2;\n", "4 / /*c*/2;\n"),
+        ("#define VOID()\n/VOID()*2; +VOID()+2;\n", "/ *2; + +2;\n"),
+        ("#define F(x) x+x\n#define N() 1\nF(N());\n", "1+1;\n"),
+    ] {
+        assert_eq!(preserved_output(source, true).0, expected, "{}", source);
     }
 }
 
@@ -195,19 +271,19 @@ fn preserved_properties_quotes_end_at_newlines() {
     for (source, expected) in [
         (
             "#define FEATURE 7\nvalue=\"first\\\nFEATURE // comment\nnext=FEATURE\n",
-            "value=\"first\\\n7 // comment\nnext= 7\n",
+            "value=\"first\\\n7 // comment\nnext=7\n",
         ),
         (
             "#define FEATURE 7\nvalue='first\\\nFEATURE /* comment */\nnext=FEATURE\n",
-            "value='first\\\n7 /* comment */\nnext= 7\n",
+            "value='first\\\n7 /* comment */\nnext=7\n",
         ),
         (
             "#define FEATURE 7\nvalue=\"FEATURE /* literal */\"\nnext=FEATURE\n",
-            "value=\"FEATURE /* literal */\"\nnext= 7\n",
+            "value=\"FEATURE /* literal */\"\nnext=7\n",
         ),
         (
             "#define FEATURE 7\nvalue=\"one\"\"two\"FEATURE\n",
-            "value=\"one\"\"two\" 7\n",
+            "value=\"one\"\"two\"7\n",
         ),
         ("value=\"unclosed", "value=\"unclosed\n"),
         ("value='unclosed", "value='unclosed\n"),
@@ -249,7 +325,7 @@ fn text_output_preserves_literals_comments_and_macro_boundaries() {
     }
     assert_eq!(
         output,
-        "value= - 1 \\\n\"NEG\" /* NEG\n#if 0\n*/\nafter=0.50\n"
+        "value=-1 \\\n\"NEG\" /* NEG\n#if 0\n*/\nafter=0.50\n"
     );
 }
 
@@ -1799,7 +1875,7 @@ fn text_macros_keep_invocation_lines_and_property_spelling() {
     assert_eq!(lines, [1, 3, 5]);
     assert_eq!(
         output,
-        "entry= 0x10\ncalc= 2 + 1\nline= 5\nliteral=\"https://host/*literal*/\" \\u0041\n"
+        "entry=0x10\ncalc=2+1\nline=5\nliteral=\"https://host/*literal*/\" \\u0041\n"
     );
 }
 

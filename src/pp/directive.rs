@@ -189,7 +189,7 @@ impl<'a> DirectiveProcessor<'a> {
                 token = self.get_lexer_token()?;
                 match &token.value {
                     LexerTokenValue::Punct(Punct::RightParen) => {
-                        token = self.get_lexer_token()?;
+                        token = self.get_raw_lexer_token()?;
                         break;
                     }
 
@@ -230,9 +230,21 @@ impl<'a> DirectiveProcessor<'a> {
             if token.value == LexerTokenValue::NewLine {
                 break;
             }
-            define.tokens.push(convert_lexer_token_to_step(token)?);
-            token = self.get_lexer_token()?;
+            let mut replacement = convert_lexer_token_to_step(token)?;
+            if replacement.trivia
+                && self.lexer.text_mode() == lexer::TextMode::Glsl
+                && replacement.text.starts_with('/')
+            {
+                self.comments.push_back(replacement.clone());
+                replacement.text = " ".to_owned();
+            }
+            define.tokens.push(replacement);
+            token = self.get_raw_lexer_token()?;
         }
+        define.tokens = text::replacement_tokens(
+            define.tokens,
+            self.lexer.text_mode() == lexer::TextMode::Properties,
+        );
 
         // Defines are allowed to be redefined if they are exactly the same up to token locations.
         if let Some(previous_define) = self.defines.get(&define.name) {
@@ -271,10 +283,7 @@ impl<'a> DirectiveProcessor<'a> {
                 Some(Ok(lexer_token)) => {
                     // Skip over newlines (the lexer always adds a newline, which would cause an
                     // error in convert_lexer_token).
-                    if matches!(
-                        lexer_token.value,
-                        LexerTokenValue::NewLine | LexerTokenValue::Trivia
-                    ) {
+                    if lexer_token.value == LexerTokenValue::NewLine {
                         continue;
                     }
 
@@ -681,6 +690,11 @@ impl<'a> DirectiveProcessor<'a> {
 }
 
 impl<'a> MeLexer for DirectiveProcessor<'a> {
+    /// Uses the selected source policy when expanding macro arguments.
+    fn text_mode(&self) -> lexer::TextMode {
+        self.lexer.text_mode()
+    }
+
     fn charge(&self, location: Location) -> Step<()> {
         charge_work(&self.work, location)
     }

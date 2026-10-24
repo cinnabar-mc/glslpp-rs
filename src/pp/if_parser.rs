@@ -60,6 +60,7 @@ impl<'macros> IfParser<'macros> {
         } else {
             loop {
                 match self.macro_processor.step(&mut self.lexer) {
+                    Ok(token) if token.trivia => continue,
                     Ok(token) => break token,
                     Err(StepExit::Continue) => continue,
                     Err(StepExit::Finished) => return Ok(None),
@@ -134,7 +135,6 @@ impl<'macros> IfParser<'macros> {
             name,
             location,
             location,
-            false,
             &mut self.lexer,
         )? {
             Ok(None)

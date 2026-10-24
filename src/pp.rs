@@ -27,8 +27,7 @@ struct DefineInvocation {
     define: Rc<Define>,
     define_position: usize,
     location: Location,
-    space: bool,
-    first: bool,
+    fragment: u64,
 
     parameters: Vec<Vec<Token>>,
     parameter_expanding: usize,
@@ -36,14 +35,9 @@ struct DefineInvocation {
 }
 
 impl DefineInvocation {
-    /// Applies invocation spacing and source lines to a replacement token.
-    fn output_token(&mut self, mut token: Token) -> Token {
+    /// Keeps the outer invocation line without changing replacement spelling.
+    fn output_token(&self, mut token: Token) -> Token {
         token.output_location = self.location;
-        token.synthesized = true;
-        if self.first {
-            token.space = self.space;
-            self.first = false;
-        }
         token
     }
 }
@@ -72,6 +66,10 @@ trait MeLexer {
     fn apply_line_offset(&self, line: u32, location: Location) -> Step<u32>;
     /// Spends one unit of the preprocessing work budget for a macro-processed token.
     fn charge(&self, location: Location) -> Step<()>;
+    /// Selects whitespace handling for macro arguments.
+    fn text_mode(&self) -> lexer::TextMode {
+        lexer::TextMode::Tokens
+    }
 }
 
 /// Takes one token from `work`, failing once a configured budget is spent.
@@ -136,10 +134,9 @@ pub(crate) fn convert_lexer_token(
         location,
         output_location: location,
         text: token.text,
-        space: token.leading_whitespace,
         trivia,
         opaque,
-        synthesized: false,
+        fragment: 0,
     })
 }
 
@@ -152,11 +149,15 @@ fn legal_redefinition(a: &Define, b: &Define) -> bool {
     assert!(a.name == b.name);
     a.function_like == b.function_like
         && a.params == b.params
-        && a.tokens.len() == b.tokens.len()
         && a.tokens
             .iter()
-            .zip(&b.tokens)
-            .all(|(ta, tb)| ta.value == tb.value)
+            .filter(|token| !token.trivia)
+            .map(|token| &token.value)
+            .eq(b
+                .tokens
+                .iter()
+                .filter(|token| !token.trivia)
+                .map(|token| &token.value))
 }
 
 #[derive(Default)]
@@ -166,15 +167,22 @@ struct MacroProcessor {
 
     peeked: VecDeque<Step<Token>>,
     define_line: u32,
+    fragments: Rc<Cell<u64>>,
 }
 
 impl MacroProcessor {
+    /// Allocates a fragment shared by literal tokens from one macro invocation.
+    fn next_fragment(&self) -> u64 {
+        let fragment = self.fragments.get() + 1;
+        self.fragments.set(fragment);
+        fragment
+    }
+
     fn start_define_invocation(
         &mut self,
         name: &str,
         location: Location,
         output_location: Location,
-        space: bool,
         lexer: &mut dyn MeLexer,
     ) -> Step<bool> {
         // Defines can be expanding only once, it is not possible to do recursive defines
@@ -187,8 +195,7 @@ impl MacroProcessor {
                 define: define.clone(),
                 define_position: 0,
                 location: output_location,
-                space,
-                first: true,
+                fragment: self.next_fragment(),
 
                 parameters: Default::default(),
                 parameter_position: 0,
@@ -305,6 +312,19 @@ impl MacroProcessor {
 
             current_location = token.location;
 
+            // Properties arguments discard whitespace before grouping punctuation.
+            if lexer.text_mode() == lexer::TextMode::Properties
+                && matches!(
+                    token.value,
+                    TokenValue::Punct(Punct::LeftParen | Punct::RightParen | Punct::Comma)
+                )
+            {
+                let argument = arguments.last_mut().unwrap();
+                while argument.last().is_some_and(|token: &Token| token.trivia) {
+                    argument.pop();
+                }
+            }
+
             // Handle special tokens
             match token.value {
                 // Avoid overflow on parenthesis nesting counting.
@@ -374,8 +394,15 @@ impl MacroProcessor {
             fn charge(&self, location: Location) -> Step<()> {
                 self.parent_lexer.charge(location)
             }
+
+            /// Uses the parent's spelling policy for nested macro arguments.
+            fn text_mode(&self) -> lexer::TextMode {
+                self.parent_lexer.text_mode()
+            }
         }
 
+        let collapse = lexer.text_mode() == lexer::TextMode::Properties;
+        let parameter = text::replacement_tokens(parameter, collapse);
         let mut parameter_lexer = ExpandParameterLexer {
             parent_lexer: lexer,
             expander: self,
@@ -383,12 +410,17 @@ impl MacroProcessor {
             position: 0,
         };
 
-        let mut processor: MacroProcessor = Default::default();
+        let mut processor = MacroProcessor {
+            fragments: self.fragments.clone(),
+            ..Default::default()
+        };
         let mut expanded_parameters = Default::default();
         loop {
             match processor.step(&mut parameter_lexer) {
                 Err(err @ StepExit::Error(_)) => return Err(err),
-                Err(StepExit::Finished) => return Ok(expanded_parameters),
+                Err(StepExit::Finished) => {
+                    return Ok(text::replacement_tokens(expanded_parameters, collapse))
+                }
                 Err(StepExit::Continue) => continue,
                 Ok(token) => {
                     if let TokenValue::Ident(name) = &token.value {
@@ -396,7 +428,6 @@ impl MacroProcessor {
                             name,
                             token.location,
                             token.output_location,
-                            token.space,
                             &mut parameter_lexer,
                         )? {
                             continue;
@@ -449,7 +480,9 @@ impl MacroProcessor {
                     }
                 }
 
-                return Ok(invocation.output_token(token.clone()));
+                let mut token = token.clone();
+                token.fragment = invocation.fragment;
+                return Ok(invocation.output_token(token));
             } else {
                 self.defines_being_expanded.remove(&invocation.define.name);
                 self.define_invocations.pop();
@@ -484,7 +517,7 @@ impl MacroProcessor {
                     value.to_string(),
                 );
                 generated.output_location = token.output_location;
-                generated.space = token.space;
+                generated.fragment = self.next_fragment();
                 return Ok(generated);
             }
         }
@@ -540,6 +573,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Retains source trivia, quotes and property punctuation for `next_text`.
+    /// Macro replacements concatenate literally, with definition whitespace collapsed to spaces.
     /// Set this before adding defines or consuming input. The ordinary GLSL API is unchanged.
     pub fn set_preserve_text(&mut self, preserve: bool) {
         self.directive_processor.preserve_text = preserve;
@@ -547,6 +581,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Preserves GLSL comments and spelling while retaining line splicing and strict active tokens.
+    /// Adds a separator only at fragment joints whose token classes could merge.
     pub fn set_preserve_glsl_text(&mut self) {
         self.directive_processor.preserve_text = true;
         self.directive_processor
@@ -565,7 +600,11 @@ impl<'a> Preprocessor<'a> {
     pub fn next_text(&mut self) -> Option<Result<text::TextToken, (PreprocessorError, Location)>> {
         loop {
             match self.step() {
-                Ok(token) => return Some(Ok(self.text_output.render(token))),
+                Ok(token) => {
+                    return Some(Ok(self
+                        .text_output
+                        .render(token, self.directive_processor.lexer.text_mode())))
+                }
                 Err(StepExit::Error(error)) => return Some(Err(error)),
                 Err(StepExit::Finished) => return None,
                 Err(StepExit::Continue) => continue,
@@ -613,7 +652,6 @@ impl<'a> Preprocessor<'a> {
                 name,
                 token.location,
                 token.output_location,
-                token.space,
                 &mut self.directive_processor,
             )? {
                 return Continue.into();
