@@ -52,34 +52,36 @@ impl<'macros> IfParser<'macros> {
         }
     }
 
-    /// Consumes a token, skipping expansion steps while preserving errors and end of input.
-    fn raw_next(&mut self) -> Step<Option<Token>> {
-        if let Some(token) = self.carry.take() {
-            return Ok(Some(token));
-        }
-        loop {
-            match self.macro_processor.step(&mut self.lexer) {
-                Ok(token) => return Ok(Some(token)),
-                Err(StepExit::Continue) => continue,
-                Err(StepExit::Finished) => return Ok(None),
-                Err(error) => return Err(error),
+    /// Reads a validated token without starting a new macro invocation.
+    /// All expression tokens, including unexpanded `defined` operands, pass through here.
+    fn unexpanded_next(&mut self) -> Step<Option<Token>> {
+        let token = if let Some(token) = self.carry.take() {
+            token
+        } else {
+            loop {
+                match self.macro_processor.step(&mut self.lexer) {
+                    Ok(token) => break token,
+                    Err(StepExit::Continue) => continue,
+                    Err(StepExit::Finished) => return Ok(None),
+                    Err(error) => return Err(error),
+                }
             }
-        }
-    }
-
-    /// Helper method to consume the next token with define expansion
-    fn next(&mut self) -> Step<Option<Token>> {
-        let token = match self.raw_next()? {
-            Some(t) => t,
-            None => return Ok(None),
         };
-
         if token.opaque {
             return Err(StepExit::Error((
                 PreprocessorError::UnexpectedToken(token.value),
                 token.location,
             )));
         }
+        Ok(Some(token))
+    }
+
+    /// Helper method to consume the next token with define expansion
+    fn next(&mut self) -> Step<Option<Token>> {
+        let token = match self.unexpanded_next()? {
+            Some(t) => t,
+            None => return Ok(None),
+        };
         Ok(match token.value {
             TokenValue::Ident(ref name) if name != "defined" => {
                 match self.add_define(name, token.location)? {
@@ -100,8 +102,8 @@ impl<'macros> IfParser<'macros> {
     /// Helper method to consume the next token without define expansion
     ///
     /// Returns an EOI error if there are no further tokens
-    fn expect_raw_next(&mut self) -> Step<Token> {
-        self.raw_next()?.ok_or(StepExit::Error((
+    fn expect_unexpanded_next(&mut self) -> Step<Token> {
+        self.unexpanded_next()?.ok_or(StepExit::Error((
             PreprocessorError::UnexpectedEndOfInput,
             self.location,
         )))
@@ -155,12 +157,12 @@ impl<'macros> IfParser<'macros> {
     }
 
     fn handle_defined(&mut self) -> Step<i64> {
-        let next = self.expect_raw_next()?;
+        let next = self.expect_unexpanded_next()?;
 
         match next.value {
             TokenValue::Ident(ref name) => Ok(self.lexer.defines.get(name).is_some() as i64),
             TokenValue::Punct(Punct::LeftParen) => {
-                let name_token = self.expect_raw_next()?;
+                let name_token = self.expect_unexpanded_next()?;
                 let name = match name_token.value {
                     TokenValue::Ident(name) => Ok(name),
                     value => Err(StepExit::Error((

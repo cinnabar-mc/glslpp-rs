@@ -827,3 +827,27 @@ fn lex_had_comments() {
 }
 
 // TODO test has_whitespace
+
+#[test]
+fn property_quotes_leave_the_newline_for_the_next_token() {
+    for quote in ['\'', '"'] {
+        for suffix in ["", "\\", "\\\\"] {
+            let source = format!("{quote}value{suffix}\n// comment\nnext");
+            let mut lexer = Lexer::new(&source);
+            lexer.set_preserve_text(true);
+            let quoted = lexer.next().unwrap().unwrap();
+            assert_eq!(
+                quoted.value,
+                TokenValue::Opaque(format!("{quote}value{suffix}"))
+            );
+            assert_eq!(quoted.location.end as usize, source.find('\n').unwrap());
+            assert_eq!(unwrap_token_value(lexer.next()), TokenValue::NewLine);
+            assert_eq!(unwrap_token_value(lexer.next()), TokenValue::Trivia);
+            assert_eq!(unwrap_token_value(lexer.next()), TokenValue::NewLine);
+            let next = lexer.next().unwrap().unwrap();
+            assert_eq!(next.value, TokenValue::Ident("next".into()));
+            assert!(next.start_of_line);
+            assert_eq!(next.location.line(), 3);
+        }
+    }
+}

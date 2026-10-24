@@ -90,6 +90,7 @@ fn preservation_modes_have_identical_preprocessing_results() {
         "#define DIV /\n4 DIV/*c*/2; 4 DIV/2; 4 DIV*2;",
         "#define PLUS +\n1 PLUS+2;\n#define NUM() 1\nNUM().0; NUM()e;",
         "#if 0\n#error It's skipped\n@ 'bad\n#else\n7\n#endif\n",
+        "#define FEATURE 0\n#if defined FEATURE && defined(FEATURE) && !defined MISSING\n7\n#endif\n",
     ] {
         let expected = preprocessed_values(source);
         for glsl in [false, true] {
@@ -107,6 +108,55 @@ fn preservation_modes_have_identical_preprocessing_results() {
                 .collect();
             assert_eq!(preprocessed_values(&text), rendered_values, "{}", text);
         }
+    }
+}
+
+#[test]
+fn preserved_properties_quotes_end_at_newlines() {
+    for value in [
+        "It's fine",
+        "\"unclosed",
+        "'unclosed",
+        "\"unclosed\\",
+        "'unclosed\\",
+        "\"unclosed\\\\",
+        "'unclosed\\\\",
+    ] {
+        for newline in ["\n", "\r", "\r\n", "\n\r"] {
+            let source = format!(
+                "description={value}{newline}#if 0{newline}hidden=1{newline}#endif{newline}visible=2{newline}"
+            );
+            let (text, _) = preserved_output(&source, false);
+            assert_eq!(
+                text,
+                format!("description={value}{newline}{newline}visible=2{newline}"),
+                "{source:?}"
+            );
+            assert!(Preprocessor::new(&source).any(|token| token.is_err()));
+        }
+    }
+
+    for (source, expected) in [
+        (
+            "#define FEATURE 7\nvalue=\"first\\\nFEATURE // comment\nnext=FEATURE\n",
+            "value=\"first\\\n7 // comment\nnext=7\n",
+        ),
+        (
+            "#define FEATURE 7\nvalue='first\\\nFEATURE /* comment */\nnext=FEATURE\n",
+            "value='first\\\n7 /* comment */\nnext=7\n",
+        ),
+        (
+            "#define FEATURE 7\nvalue=\"FEATURE /* literal */\"\nnext=FEATURE\n",
+            "value=\"FEATURE /* literal */\"\nnext=7\n",
+        ),
+        (
+            "#define FEATURE 7\nvalue=\"one\"\"two\"FEATURE\n",
+            "value=\"one\"\"two\"7\n",
+        ),
+        ("value=\"unclosed", "value=\"unclosed\n"),
+        ("value='unclosed", "value='unclosed\n"),
+    ] {
+        assert_eq!(preserved_output(source, false).0, expected, "{source:?}");
     }
 }
 
@@ -1699,7 +1749,22 @@ fn text_macros_keep_invocation_lines_and_property_spelling() {
 
 #[test]
 fn text_literals_are_not_accepted_as_condition_identifiers() {
-    for condition in ["\\", "\"literal\"", "1.0.0"] {
+    for condition in [
+        "\\",
+        "\"literal\"",
+        "1.0.0",
+        "defined(\"FEATURE\")",
+        "defined('F')",
+        "defined(\\)",
+        "defined(09)",
+        "defined \"FEATURE\"",
+        "defined 'F'",
+        "defined \\",
+        "defined 09",
+        "defined(\"unclosed",
+        "defined 'unclosed",
+        "1 + defined(\"FEATURE\")",
+    ] {
         let source = format!("#if {}\nbad=1\n#endif\nafter=ok\n", condition);
         let mut pp = Preprocessor::new(&source);
         pp.set_preserve_text(true);

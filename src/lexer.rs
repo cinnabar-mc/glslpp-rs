@@ -127,6 +127,8 @@ pub struct ReplaceComments<'a> {
     preserve_text: bool,
     quote: Option<char>,
     escaped: bool,
+    /// Whether the last returned character belongs to a quoted token.
+    quoted: bool,
 }
 
 // The lexer wants to know when whitespace is a comment to know if a comment was ever processed.
@@ -141,6 +143,7 @@ impl<'a> ReplaceComments<'a> {
             preserve_text: false,
             quote: None,
             escaped: false,
+            quoted: false,
         }
     }
 
@@ -154,8 +157,15 @@ impl<'a> Iterator for ReplaceComments<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.inner.next()?;
+        self.quoted = false;
         if self.preserve_text {
-            if let Some(quote) = self.quote {
+            if current.0 == '\n' {
+                // Splicing has already happened. Every remaining newline ends quote state,
+                // including properties continuations, whose backslashes stay literal.
+                self.quote = None;
+                self.escaped = false;
+            } else if let Some(quote) = self.quote {
+                self.quoted = true;
                 if self.escaped {
                     self.escaped = false;
                 } else if current.0 == '\\' {
@@ -167,6 +177,7 @@ impl<'a> Iterator for ReplaceComments<'a> {
             }
             if matches!(current.0, '\'' | '"') {
                 self.quote = Some(current.0);
+                self.quoted = true;
             }
         }
 
@@ -265,6 +276,17 @@ impl<'a> LexerCharIterator<'a> {
                 self.peeked = Some((next, ptr));
                 Some(next.0)
             }
+        }
+    }
+
+    /// Consumes a character only when the shared quote scanner includes it in this token.
+    fn next_quoted_char(&mut self) -> Option<char> {
+        self.inner.quote?;
+        self.peek_char()?;
+        if self.inner.quoted {
+            self.next_char()
+        } else {
+            None
         }
     }
 
@@ -373,6 +395,7 @@ impl<'a> Lexer<'a> {
         self.inner.inner.preserve_text = self.mode != TextMode::Tokens && !skipping;
         if skipping {
             self.inner.inner.quote = None;
+            self.inner.inner.escaped = false;
         }
     }
 
@@ -656,17 +679,8 @@ impl<'a> Iterator for Lexer<'a> {
                 }
 
                 '\'' | '"' if self.mode == TextMode::Properties && !self.skipping => {
-                    let quote = self.inner.next_char().unwrap();
-                    let mut escaped = false;
-                    while let Some(c) = self.inner.next_char() {
-                        if escaped {
-                            escaped = false;
-                        } else if c == '\\' {
-                            escaped = true;
-                        } else if c == quote {
-                            break;
-                        }
-                    }
+                    self.inner.next_char();
+                    while self.inner.next_quoted_char().is_some() {}
                     Ok(TokenValue::Opaque(String::new()))
                 }
                 c @ '0'..='9' => {
