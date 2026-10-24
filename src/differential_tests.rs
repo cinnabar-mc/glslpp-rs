@@ -1,10 +1,10 @@
-use crate::lexer::{Lexer, TokenValue as LexicalValue};
-use crate::pp::{convert_lexer_token, Preprocessor};
+use crate::lexer::{Lexer, TextMode, TokenValue as LexicalValue};
+use crate::pp::{convert_lexer_token, text::Output, Preprocessor};
 use crate::token::{PreprocessorError, TokenValue};
 use alloc::{format, string::String, vec::Vec};
 
 /// Produces a repeatable choice without a random-number dependency.
-fn choose<'a>(state: &mut u64, choices: &'a [&str]) -> &'a str {
+fn choose<T: Copy>(state: &mut u64, choices: &[T]) -> T {
     *state ^= *state << 13;
     *state ^= *state >> 7;
     *state ^= *state << 17;
@@ -215,5 +215,172 @@ fn generated_glsl_matches_strict_tokens_and_directive_metadata() {
             prefix, metadata, replacement, skipped, left, gap, right
         );
         check_glsl(&source, environment);
+    }
+}
+
+#[test]
+fn generated_glsl_sequences_keep_tokens_after_rendering() {
+    let mut state = 0x474c_534c_2026_0009;
+    let atoms = [
+        "x",
+        "name",
+        "_",
+        "e",
+        "E",
+        "L",
+        "f",
+        "0",
+        "2",
+        "0x1E",
+        "1u",
+        "1e",
+        "1E",
+        "1e+",
+        "1e-",
+        "1.e",
+        ".1E",
+        "1e2",
+        "0.5",
+        ".5",
+        "+",
+        "-",
+        "*",
+        "/",
+        ".",
+        "=",
+        "<",
+        ">",
+        "<<",
+        ">>",
+        "&",
+        "|",
+        "^",
+        "!",
+        ";",
+        "ID(1e)",
+        "ID(/)",
+        "ID(x)",
+        "E()",
+        "EMPTY",
+        "JOIN(1e,+)",
+        "JOIN(/,*)",
+        "JOIN(x,y)",
+        "JOIN(,x)",
+        "JOIN(x,)",
+    ];
+    for _ in 0..10_000 {
+        let replacement = choose(
+            &mut state,
+            &[
+                "1e", "1E", "1e+", "1e-", ".1E", "x", "2", "+", "-", "*", "/",
+            ],
+        );
+        let mut source = format!(
+            "#define ID(x) x\n#define JOIN(a,b) a b\n#define EMPTY\n#define E() {}\n",
+            replacement
+        );
+        let length = choose(&mut state, &[2, 4, 8, 16]);
+        for _ in 0..length {
+            source.push_str(choose(&mut state, &atoms));
+            source.push_str(choose(
+                &mut state,
+                &[
+                    "",
+                    " ",
+                    "\t",
+                    "\n",
+                    "\\\n",
+                    "/**/",
+                    "/* *\\\\\n\n/ hidden */",
+                    "/* /\\\n* tail */",
+                    "/* \\\\\r\r\n * / */",
+                    "// *\\\\\n\n",
+                    "// \\\\\r\n\n",
+                ],
+            ));
+        }
+        source.push_str(";\n");
+        check_glsl(&source, "1e");
+    }
+}
+
+#[test]
+fn generated_glsl_token_and_comment_joints_keep_tokens() {
+    let mut state = 0x4a4f_494e_2026_0009;
+    // Independent fragments model tokens placed together after expansion, pasting or recovery.
+    let fragments = [
+        "x",
+        "_",
+        "E",
+        "L",
+        "0",
+        "2",
+        "1u",
+        "0x1E",
+        "1e",
+        "1E",
+        "1e+",
+        "1e-",
+        "1.e",
+        ".1E",
+        ".5",
+        "+",
+        "-",
+        "*",
+        "/",
+        ".",
+        "=",
+        "<",
+        ">",
+        "<<",
+        ">>",
+        "&",
+        "|",
+        "^",
+        "!",
+        ";",
+        " ",
+        "\t",
+        "\n",
+        "\\\n",
+        "/**/",
+        "/* *\\\\\n\n/ hidden */",
+        "/* \\\\\r\r\n * / */",
+        "// *\\\\\n\n",
+        "// \\\\\r\n\n",
+    ];
+    for _ in 0..10_000 {
+        let mut output = Output::default();
+        let mut text = String::new();
+        let mut expected = Vec::new();
+        let mut input = Vec::new();
+        let length = choose(&mut state, &[2, 4, 8, 16]);
+        for _ in 0..length {
+            let fragment = choose(&mut state, &fragments);
+            input.push(fragment);
+            let mut lexer = Lexer::new(fragment);
+            lexer.set_text_mode(TextMode::Glsl);
+            for token in lexer {
+                let token = token.unwrap();
+                if token.value == LexicalValue::NewLine
+                    && token.location.start == token.location.end
+                {
+                    continue;
+                }
+                let token = convert_lexer_token(token).unwrap();
+                if !token.trivia {
+                    expected.push(token.value.clone());
+                }
+                text.push_str(&output.render(token, TextMode::Glsl).text);
+            }
+        }
+        assert!(!text.contains("\\\n"), "{:?}: {:?}", input, text);
+        let downstream = downstream_glsl(&text);
+        let actual: Vec<_> = Lexer::new(&downstream)
+            .map(Result::unwrap)
+            .filter(|token| token.value != LexicalValue::NewLine)
+            .map(|token| convert_lexer_token(token).unwrap().value)
+            .collect();
+        assert_eq!(actual, expected, "{:?}: {:?}", input, text);
     }
 }

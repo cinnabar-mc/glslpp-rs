@@ -28,7 +28,6 @@ struct DefineInvocation {
     define: Rc<Define>,
     define_position: usize,
     location: Location,
-    fragment: u64,
 
     parameters: Vec<Vec<Token>>,
     parameter_expanding: usize,
@@ -137,7 +136,6 @@ pub(crate) fn convert_lexer_token(
         text: token.text,
         trivia,
         opaque,
-        fragment: 0,
     })
 }
 
@@ -168,17 +166,9 @@ struct MacroProcessor {
 
     peeked: VecDeque<Step<Token>>,
     define_line: u32,
-    fragments: Rc<Cell<u64>>,
 }
 
 impl MacroProcessor {
-    /// Allocates a fragment shared by literal tokens from one macro invocation.
-    fn next_fragment(&self) -> u64 {
-        let fragment = self.fragments.get() + 1;
-        self.fragments.set(fragment);
-        fragment
-    }
-
     fn start_define_invocation(
         &mut self,
         name: &str,
@@ -196,7 +186,6 @@ impl MacroProcessor {
                 define: define.clone(),
                 define_position: 0,
                 location: output_location,
-                fragment: self.next_fragment(),
 
                 parameters: Default::default(),
                 parameter_position: 0,
@@ -411,10 +400,7 @@ impl MacroProcessor {
             position: 0,
         };
 
-        let mut processor = MacroProcessor {
-            fragments: self.fragments.clone(),
-            ..Default::default()
-        };
+        let mut processor = MacroProcessor::default();
         let mut expanded_parameters = Default::default();
         loop {
             match processor.step(&mut parameter_lexer) {
@@ -481,9 +467,7 @@ impl MacroProcessor {
                     }
                 }
 
-                let mut token = token.clone();
-                token.fragment = invocation.fragment;
-                return Ok(invocation.output_token(token));
+                return Ok(invocation.output_token(token.clone()));
             } else {
                 self.defines_being_expanded.remove(&invocation.define.name);
                 self.define_invocations.pop();
@@ -511,7 +495,6 @@ impl MacroProcessor {
                 let mut generated =
                     Token::generated(TokenValue::Integer(value.clone()), token.location, value);
                 generated.output_location = token.output_location;
-                generated.fragment = self.next_fragment();
                 return Ok(generated);
             }
         }
@@ -577,7 +560,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Preserves GLSL comments and spelling while retaining line splicing and strict active tokens.
-    /// Adds a separator only at fragment joints whose token classes could merge.
+    /// Checks adjacent spellings with the GLSL lexer and separates joints that change tokens.
     pub fn set_preserve_glsl_text(&mut self) {
         self.directive_processor.preserve_text = true;
         self.directive_processor

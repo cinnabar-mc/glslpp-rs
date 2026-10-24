@@ -333,6 +333,22 @@ fn preserved_line_macros_match_token_mode() {
 }
 
 #[test]
+fn preserved_block_comments_cannot_splice_again_downstream() {
+    let source = "/* *\\\\\n\n/ hidden */ int visible;\n";
+    assert_preserved_tokens(source);
+}
+
+#[test]
+fn preserved_exponent_macro_boundaries_keep_signs_separate() {
+    for exponent in ["1e", "1E", "1.e", ".1E"] {
+        for sign in ["+", "-"] {
+            let source = format!("#define E() {}\nE(){}2;\n", exponent, sign);
+            assert_preserved_tokens(&source);
+        }
+    }
+}
+
+#[test]
 fn preserved_line_comments_cannot_splice_again_downstream() {
     for newline in ["\n", "\r", "\r\n", "\n\r"] {
         for count in 1..=4 {

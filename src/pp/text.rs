@@ -1,7 +1,6 @@
-use crate::lexer::TextMode;
-use crate::token::{Location, Punct, Token as PublicToken, TokenValue};
+use crate::lexer::{Lexer, TextMode, TokenValue as LexicalValue};
+use crate::token::{Location, Token as PublicToken, TokenValue};
 use alloc::{borrow::ToOwned, format, string::String, vec::Vec};
-use unicode_ident::is_xid_continue;
 
 /// One preprocessed text fragment at its original invocation line.
 #[derive(Debug)]
@@ -22,8 +21,6 @@ pub(crate) struct SourceToken {
     pub text: String,
     pub trivia: bool,
     pub opaque: bool,
-    /// Zero for source text; otherwise identifies one macro replacement.
-    pub fragment: u64,
     pub output_location: Location,
 }
 
@@ -36,7 +33,6 @@ impl SourceToken {
             text,
             trivia: false,
             opaque: false,
-            fragment: 0,
             output_location: location,
         }
     }
@@ -71,51 +67,27 @@ pub(super) fn replacement_tokens(tokens: Vec<SourceToken>, collapse: bool) -> Ve
     result
 }
 
-/// The token classes that can absorb text at an expansion joint.
-enum Class {
-    Ident,
-    Number,
-    Punct(Punct),
-    Other,
-}
-
-/// The last emitted token, without retaining or re-lexing its spelling.
+/// The spelling and value of the last token emitted without trailing trivia.
 struct Boundary {
-    class: Class,
-    fragment: u64,
-    end: u32,
+    text: String,
+    value: TokenValue,
 }
 
 impl Boundary {
-    /// Reports whether adjacent fragments could form a different token or comment.
+    /// Re-lexes a joint, including splicing, to check that its token values survive.
     fn joins(&self, token: &SourceToken) -> bool {
-        let first = match token.text.chars().next() {
-            Some(first) => first,
-            None => return false,
-        };
-        match self.class {
-            Class::Ident => is_xid_continue(first),
-            Class::Number => is_xid_continue(first) || first == '.',
-            Class::Punct(punct) => match punct {
-                Punct::LeftAngle => matches!(first, '<' | '='),
-                Punct::RightAngle => matches!(first, '>' | '='),
-                Punct::Plus => matches!(first, '+' | '='),
-                Punct::Minus => matches!(first, '-' | '='),
-                Punct::Ampersand => matches!(first, '&' | '='),
-                Punct::Pipe => matches!(first, '|' | '='),
-                Punct::Caret => matches!(first, '^' | '='),
-                Punct::Slash => matches!(first, '/' | '*' | '='),
-                Punct::Equal
-                | Punct::Bang
-                | Punct::Star
-                | Punct::Percent
-                | Punct::LeftShift
-                | Punct::RightShift => first == '=',
-                Punct::Dot => first.is_ascii_digit(),
-                _ => false,
-            },
-            Class::Other => false,
-        }
+        let joint = format!("{}{}", self.text, token.text);
+        let actual = Lexer::new(&joint)
+            .filter(|item| !matches!(item, Ok(token) if token.value == LexicalValue::NewLine))
+            .map(|item| {
+                item.and_then(super::convert_lexer_token)
+                    .map(|token| token.value)
+            });
+        let expected = core::iter::once(&self.value)
+            .chain((!token.trivia).then_some(&token.value))
+            .cloned()
+            .map(Ok);
+        !actual.eq(expected)
     }
 }
 
@@ -126,26 +98,21 @@ pub(crate) struct Output {
 }
 
 impl Output {
-    /// Concatenates properties literally and separates GLSL only at unsafe fragment joints.
+    /// Concatenates properties literally and checks every adjacent GLSL token joint.
     pub(crate) fn render(&mut self, token: SourceToken, mode: TextMode) -> TextToken {
         let separated = mode == TextMode::Glsl
-            && self.previous.as_ref().is_some_and(|previous| {
-                (previous.fragment != token.fragment || previous.end != token.location.start)
-                    && previous.joins(&token)
-            });
+            && !token.text.is_empty()
+            && self
+                .previous
+                .as_ref()
+                .is_some_and(|previous| previous.joins(&token));
         if !token.text.is_empty() {
             self.previous = if token.trivia {
                 None
             } else {
                 Some(Boundary {
-                    class: match token.value {
-                        TokenValue::Ident(_) if !token.opaque => Class::Ident,
-                        TokenValue::Integer(_) | TokenValue::Float(_) => Class::Number,
-                        TokenValue::Punct(punct) => Class::Punct(punct),
-                        _ => Class::Other,
-                    },
-                    fragment: token.fragment,
-                    end: token.location.end,
+                    text: token.text.clone(),
+                    value: token.value.clone(),
                 })
             };
         }

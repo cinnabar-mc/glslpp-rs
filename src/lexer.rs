@@ -628,6 +628,17 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// Replaces comments that could splice again with the same newlines and one space.
+fn normalize_comment(text: String) -> String {
+    if text.contains("\\\n") || text.ends_with('\\') {
+        let mut replacement = String::from(" ");
+        replacement.extend(text.chars().filter(|&ch| ch == '\n'));
+        replacement
+    } else {
+        text
+    }
+}
+
 impl Iterator for Lexer<'_> {
     type Item = LexerItem;
 
@@ -721,9 +732,8 @@ impl Iterator for Lexer<'_> {
             } else {
                 String::new()
             };
-            // A second compiler pass must not splice the newline ending this comment.
-            if self.mode == TextMode::Glsl && text.starts_with("//") && text.ends_with('\\') {
-                text.push(' ');
+            if self.mode == TextMode::Glsl && current_char == COMMENT_SENTINEL_VALUE {
+                text = normalize_comment(text);
             }
             let value = match value {
                 Ok(TokenValue::Trivia)
