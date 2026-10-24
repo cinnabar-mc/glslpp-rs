@@ -1,6 +1,7 @@
 use crate::lexer::{Lexer, TokenValue as LexicalValue};
 use crate::pp::{convert_lexer_token, Preprocessor};
 use crate::token::{PreprocessorError, TokenValue};
+use alloc::{format, string::String, vec::Vec};
 
 /// Produces a repeatable choice without a random-number dependency.
 fn choose<'a>(state: &mut u64, choices: &'a [&str]) -> &'a str {

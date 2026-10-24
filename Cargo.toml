@@ -1,6 +1,7 @@
 [package]
 name = "pp-rs"
 version = "0.2.1"
+edition = "2021"
 authors = ["pp-rs Developers"]
 description = "Shader preprocessor"
 homepage = "https://github.com/Kangz/glslpp-rs"
@@ -9,4 +10,5 @@ keywords = ["shader", "preprocessor", "glsl"]
 license = "BSD-3-Clause"
 
 [dependencies]
-unicode-xid = "0.2"
+hashbrown = { version = "0.15.2", default-features = false, features = ["default-hasher"] }
+unicode-ident = "1.0"

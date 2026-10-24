@@ -54,7 +54,7 @@ pub(super) struct DirectiveProcessor<'a> {
     pub(super) iris_conditions: bool,
     pub(super) iris_recovery: bool,
     pub(super) preserve_text: bool,
-    comments: std::collections::VecDeque<Token>,
+    comments: VecDeque<Token>,
 }
 
 impl<'a> DirectiveProcessor<'a> {

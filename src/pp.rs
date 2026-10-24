@@ -1,12 +1,13 @@
 use crate::lexer::{self, Token as LexerToken, TokenValue as LexerTokenValue};
 use crate::token::*;
-use std::{
-    cell::Cell,
-    cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
-    convert::TryFrom,
-    rc::Rc,
-};
+use alloc::borrow::ToOwned;
+use alloc::collections::VecDeque;
+use alloc::rc::Rc;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+use core::{cell::Cell, cmp::Ordering, convert::TryFrom};
+use hashbrown::{HashMap, HashSet};
 
 mod directive;
 mod if_parser;
@@ -369,7 +370,7 @@ impl MacroProcessor {
             position: usize,
         }
 
-        impl<'a> MeLexer for ExpandParameterLexer<'a> {
+        impl MeLexer for ExpandParameterLexer<'_> {
             fn step(&mut self) -> Step<Token> {
                 if let Some(token) = self.tokens.get(self.position) {
                     self.position += 1;
@@ -506,20 +507,9 @@ impl MacroProcessor {
                     token.location.line
                 };
 
-                let value = lexer.apply_line_offset(line, token.location)? as u64;
-                let mut generated = Token::generated(
-                    TokenValue::Integer(Integer {
-                        value,
-                        signed: false,
-                        width: 32,
-                    }),
-                    token.location,
-                    if lexer.text_mode() == lexer::TextMode::Glsl {
-                        format!("{}u", value)
-                    } else {
-                        value.to_string()
-                    },
-                );
+                let value = lexer.apply_line_offset(line, token.location)?.to_string();
+                let mut generated =
+                    Token::generated(TokenValue::Integer(value.clone()), token.location, value);
                 generated.output_location = token.output_location;
                 generated.fragment = self.next_fragment();
                 return Ok(generated);
@@ -669,7 +659,7 @@ impl<'a> Preprocessor<'a> {
 
 pub type PreprocessorItem = Result<crate::token::Token, (PreprocessorError, Location)>;
 
-impl<'a> Iterator for Preprocessor<'a> {
+impl Iterator for Preprocessor<'_> {
     type Item = PreprocessorItem;
 
     fn next(&mut self) -> Option<Self::Item> {

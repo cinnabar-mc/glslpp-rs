@@ -1,6 +1,7 @@
-use crate::token::{Float, Integer, Location, PreprocessorError, Punct};
-use std::str::Chars;
-use unicode_xid::UnicodeXID;
+use crate::token::{Location, PreprocessorError, Punct};
+use alloc::{borrow::ToOwned, string::String};
+use core::str::Chars;
+use unicode_ident::{is_xid_continue, is_xid_start};
 
 type CharAndLine = (char, u32);
 
@@ -35,7 +36,7 @@ impl<'a> CharsAndLine<'a> {
     }
 }
 
-impl<'a> Iterator for CharsAndLine<'a> {
+impl Iterator for CharsAndLine<'_> {
     type Item = CharAndLine;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -95,7 +96,7 @@ impl<'a> SkipBackslashNewline<'a> {
     }
 }
 
-impl<'a> Iterator for SkipBackslashNewline<'a> {
+impl Iterator for SkipBackslashNewline<'_> {
     type Item = CharAndLine;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -152,7 +153,7 @@ impl<'a> ReplaceComments<'a> {
     }
 }
 
-impl<'a> Iterator for ReplaceComments<'a> {
+impl Iterator for ReplaceComments<'_> {
     type Item = CharAndLine;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -315,8 +316,8 @@ pub enum TokenValue {
 
     // Regular token values
     Ident(String),
-    Integer(Integer),
-    Float(Float),
+    Integer(String),
+    Float(String),
     Punct(Punct),
 }
 
@@ -409,39 +410,15 @@ impl<'a> Lexer<'a> {
     fn parse_identifier(&mut self) -> Result<TokenValue, PreprocessorError> {
         let mut identifier = String::default();
 
-        if let Some(c) = self.next_char_if(|c| c.is_xid_start() || c == '_') {
+        if let Some(c) = self.next_char_if(|c| is_xid_start(c) || c == '_') {
             identifier.push(c);
         }
 
-        let rest = self.consume_chars(|c| c.is_xid_continue());
+        let rest = self.consume_chars(is_xid_continue);
         identifier.push_str(&rest);
 
         // TODO check if identifier is larger than the limit.
         Ok(TokenValue::Ident(identifier))
-    }
-
-    fn parse_integer_signedness_suffix(&mut self) -> bool {
-        self.next_char_if(|c| c == 'u' || c == 'U').is_none()
-    }
-
-    fn parse_integer_width_suffix(&mut self) -> Result<i32, PreprocessorError> {
-        match self.inner.peek_char() {
-            Some('l') | Some('L') => Err(PreprocessorError::NotSupported64BitLiteral),
-            Some('s') | Some('S') => Err(PreprocessorError::NotSupported16BitLiteral),
-            _ => Ok(32),
-        }
-    }
-
-    fn parse_float_width_suffix(&mut self) -> Result<i32, PreprocessorError> {
-        match self.inner.peek_char() {
-            Some('l') | Some('L') => Err(PreprocessorError::NotSupported64BitLiteral),
-            Some('h') | Some('H') => Err(PreprocessorError::NotSupported16BitLiteral),
-            Some('f') | Some('F') => {
-                self.inner.next_char();
-                Ok(32)
-            }
-            _ => Ok(32),
-        }
     }
 
     fn next_char_if(&mut self, predicate: impl FnOnce(char) -> bool) -> Option<char> {
@@ -464,13 +441,9 @@ impl<'a> Lexer<'a> {
     /// Keeps numeric suffixes together in properties so macros cannot expand inside them.
     fn parse_number_token(&mut self, first_char: char) -> Result<TokenValue, PreprocessorError> {
         let value = self.parse_number(first_char);
-        if self.mode == TextMode::Properties
-            && self
-                .inner
-                .peek_char()
-                .is_some_and(|ch| ch.is_xid_continue())
+        if self.mode == TextMode::Properties && self.inner.peek_char().is_some_and(is_xid_continue)
         {
-            self.consume_chars(|ch| ch.is_xid_continue());
+            self.consume_chars(is_xid_continue);
             Ok(TokenValue::Opaque(String::new()))
         } else {
             value
@@ -486,7 +459,8 @@ impl<'a> Lexer<'a> {
         // Handle hexadecimal numbers that needs to consume a..f in addition to digits.
         if first_char == '0' {
             match self.inner.peek_char() {
-                Some('x') | Some('X') => {
+                Some(c @ ('x' | 'X')) => {
+                    raw.push(c);
                     self.inner.next_char();
 
                     raw += &self.consume_chars(|c| c.is_ascii_hexdigit());
@@ -547,30 +521,27 @@ impl<'a> Lexer<'a> {
         }
 
         if is_float {
-            // TODO: Depending on the GLSL version make it an error to not have the suffix.
-            let width = self.parse_float_width_suffix()?;
-
-            Ok(TokenValue::Float(Float {
-                value: raw
-                    .parse::<f32>()
-                    .map_err(|_| PreprocessorError::FloatParsingError)?,
-                width,
-            }))
-        } else {
-            let signed = self.parse_integer_signedness_suffix();
-            let width = self.parse_integer_width_suffix()?;
-
-            // Skip the initial 0 in hexa or octal (in hexa we never added the 'x').
-            if integer_radix != 10 {
-                raw = raw.split_off(1);
+            // Parse the float width suffix
+            if let Some(c @ ('f' | 'F' | 'l' | 'L' | 'h' | 'H')) = self.inner.peek_char() {
+                self.inner.next_char();
+                raw.push(c);
             }
 
-            Ok(TokenValue::Integer(Integer {
-                value: u64::from_str_radix(&raw, integer_radix)
-                    .map_err(|_err| PreprocessorError::IntegerOverflow)?,
-                signed,
-                width,
-            }))
+            Ok(TokenValue::Float(raw))
+        } else {
+            // Parser the integer sign suffix.
+            if let Some(c @ ('u' | 'U')) = self.inner.peek_char() {
+                self.inner.next_char();
+                raw.push(c);
+            }
+
+            // Parse the integer width suffix.
+            if let Some(c @ ('l' | 'L' | 's' | 'S')) = self.inner.peek_char() {
+                self.inner.next_char();
+                raw.push(c);
+            }
+
+            Ok(TokenValue::Integer(raw))
         }
     }
 
@@ -657,7 +628,7 @@ impl<'a> Lexer<'a> {
     }
 }
 
-impl<'a> Iterator for Lexer<'a> {
+impl Iterator for Lexer<'_> {
     type Item = LexerItem;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -716,7 +687,7 @@ impl<'a> Iterator for Lexer<'a> {
                 }
                 _ => {
                     // TODO: see todo in `parse_identifier` for information
-                    if current_char.is_xid_start() || current_char == '_' {
+                    if is_xid_start(current_char) || current_char == '_' {
                         self.parse_identifier()
                     } else {
                         let saved = self.inner.clone();

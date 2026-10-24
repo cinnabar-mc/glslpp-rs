@@ -1,7 +1,12 @@
-use crate::token::{Integer, PreprocessorError, Punct};
+use crate::token::{parse_float, parse_integer, PreprocessorError, Punct};
 
 use super::{Define, Location, MacroProcessor, MeLexer, Step, StepExit, Token, TokenValue};
-use std::{cell::Cell, collections::HashMap, convert::TryInto, rc::Rc, vec};
+use alloc::borrow::ToOwned;
+use alloc::rc::Rc;
+use alloc::string::{String, ToString};
+use alloc::vec::{self, Vec};
+use core::{cell::Cell, convert::TryInto};
+use hashbrown::HashMap;
 
 /// Maximum recursive expression nesting before returning an error.
 const MAX_EXPRESSION_DEPTH: usize = 64;
@@ -140,11 +145,7 @@ impl<'macros> IfParser<'macros> {
             Ok(None)
         } else if self.parsing_if {
             Ok(Some(Token::generated(
-                TokenValue::Integer(Integer {
-                    value: 0,
-                    signed: true,
-                    width: 64,
-                }),
+                TokenValue::Integer("0".to_owned()),
                 location,
                 "0".to_owned(),
             )))
@@ -199,8 +200,12 @@ impl<'macros> IfParser<'macros> {
 
                 self.handle_defined()
             }
-            TokenValue::Integer(int) => Ok(int.value as i64),
-            TokenValue::Float(float) if self.iris_conditions => Ok(float.value as i64),
+            TokenValue::Integer(int) => parse_integer(&int)
+                .map(|value| value.value as i64)
+                .map_err(|error| StepExit::Error((error, token.location))),
+            TokenValue::Float(float) if self.iris_conditions => parse_float(&float)
+                .map(|value| value.value as i64)
+                .map_err(|error| StepExit::Error((error, token.location))),
             TokenValue::Punct(Punct::LeftParen) => {
                 let val = self.nested(Self::parse_conditional)?;
 
@@ -520,7 +525,7 @@ impl<'macros> IfParser<'macros> {
     }
 }
 
-impl<'macros> MeLexer for IfLexer<'macros> {
+impl MeLexer for IfLexer<'_> {
     fn step(&mut self) -> Step<Token> {
         self.tokens.next().ok_or(StepExit::Finished)
     }

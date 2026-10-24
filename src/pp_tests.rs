@@ -1,6 +1,13 @@
 use super::lexer::{self, Token as LexerToken, TokenValue as LexerTokenValue};
 use super::pp::{convert_lexer_token, Preprocessor, PreprocessorItem};
-use super::token::{Float, Integer, Location, PreprocessorError, Punct, Token, TokenValue};
+use super::token::{Location, PreprocessorError, Punct, Token, TokenValue};
+use alloc::vec::Vec;
+use alloc::{
+    borrow::ToOwned,
+    format,
+    string::{String, ToString},
+    vec,
+};
 
 /// Collects rendered text and semantic values from either preservation mode.
 fn preserved_output(source: &str, glsl: bool) -> (String, Vec<TokenValue>) {
@@ -197,7 +204,7 @@ fn preserved_spacing_keeps_source_and_separates_expansions() {
         ),
         ("#define N() 1\nN()/**/L;\n", "\n1/**/L;\n", "1/**/L;\n"),
         ("#define VOID()\n+VOID()+;\n", "\n++;\n", "+ +;\n"),
-        ("line=__LINE__;\n", "line=1;\n", "line=1u;\n"),
+        ("line=__LINE__;\n", "line=1;\n", "line=1;\n"),
     ] {
         assert_eq!(preserved_output(source, false).0, properties, "{}", source);
         assert_eq!(preserved_output(source, true).0, glsl, "{}", source);
@@ -446,10 +453,7 @@ fn parse_define() {
     );
     check_preprocessing_error(
         "#define 1.0",
-        PreprocessorError::UnexpectedToken(TokenValue::Float(Float {
-            value: 1.0,
-            width: 32,
-        })),
+        PreprocessorError::UnexpectedToken(TokenValue::Float("1.0".to_string())),
     );
 
     // Test that there must be a name before the new line
@@ -1313,7 +1317,7 @@ fn skipping_behavior() {
              #line 1000
          #endif
          __LINE__",
-        "4u",
+        "4",
     );
 
     // Check that #version/extension/pragma are skipped.
@@ -1335,7 +1339,7 @@ fn parse_line() {
          #line 3
          #line 0xF00
          __LINE__",
-        "0xF01u",
+        "3841",
     );
 
     // Test with something other than a number after #line (including a newline)
@@ -1352,7 +1356,7 @@ fn parse_line() {
          #line !
          #endif
          __LINE__",
-        "4u",
+        "4",
     );
     // Test that #line must have a newline after the integer (this will change when #line
     // supports constant expressions)
@@ -1368,17 +1372,17 @@ fn parse_line() {
     check_preprocessed_result(
         "#line 20 << 2 + 1
          __LINE__",
-        "161u",
+        "161",
     );
     check_preprocessed_result(
         "#line 20 * 0 -2 + 100
         __LINE__",
-        "99u",
+        "99",
     );
     check_preprocessed_result(
         "#line 0 (1 << 1 * (10)) % 2
         __LINE__",
-        "1u",
+        "1",
     );
 
     // Test passing both a line and file id is allowed.
@@ -1387,11 +1391,7 @@ fn parse_line() {
     // Test passing more numbers is invalid.
     check_preprocessing_error(
         "#line 0 1 2",
-        PreprocessorError::UnexpectedToken(TokenValue::Integer(Integer {
-            value: 2,
-            signed: true,
-            width: 32,
-        })),
+        PreprocessorError::UnexpectedToken(TokenValue::Integer("2".to_string())),
     );
 }
 
@@ -1403,18 +1403,18 @@ fn line_define() {
          __LINE__
 
          __LINE__",
-        "1u 2u 4u",
+        "1 2 4",
     );
 
     // Test that __LINE__ split over multiple lines gives the first line.
-    check_preprocessed_result("__L\\\nINE__", "1u");
+    check_preprocessed_result("__L\\\nINE__", "1");
 
     // Test that the __LINE__ define used in define gives the invocation's line
     check_preprocessed_result(
         "#define MY_DEFINE __LINE__
          MY_DEFINE
          MY\\\n_DEFINE",
-        "2u 3u",
+        "2 3",
     );
 
     // Test a corner case where the __LINE__ is a peeked token for function-like
@@ -1422,7 +1422,7 @@ fn line_define() {
     check_preprocessed_result(
         "#define A(foo) Bleh
          A __LINE__ B",
-        "A 2u B",
+        "A 2 B",
     );
 
     // Test that __LINE__ inside function like defines is the position of the closing )
@@ -1432,8 +1432,8 @@ fn line_define() {
          A(-, -)
          A(-, -
          )",
-        "- 3u - + 3u +
-         - 5u - + 5u +",
+        "- 3 - + 3 +
+         - 5 - + 5 +",
     );
 
     // Test that the __LINE__ inside a define's argument get the correct value.
@@ -1441,13 +1441,13 @@ fn line_define() {
         "#define A(X) X
          A(__LINE__
          __LINE__)",
-        "2u 3u",
+        "2 3",
     );
     check_preprocessed_result(
         "#define B(X) X
          #define A(X) B(X) + __LINE__
          A(__LINE__)",
-        "3u + 3u",
+        "3 + 3",
     );
 
     // Check that #line is taken into account and can modify the line number in both directions.
@@ -1459,14 +1459,14 @@ fn line_define() {
          #line 0
          __LINE__
          __LINE__",
-        "1001u 1002u 1u 2u",
+        "1001 1002 1 2",
     );
 
     // Check that line computations are not allowed to overflow an u32
     check_preprocessed_result(
         "#line 4294967294
          __LINE__",
-        "4294967295u",
+        "4294967295",
     );
     check_preprocessing_error(
         "#line 4294967295
@@ -1477,10 +1477,7 @@ fn line_define() {
     // Check that line directives don't allow floats
     check_preprocessing_error(
         "#line 1.0",
-        PreprocessorError::UnexpectedToken(TokenValue::Float(Float {
-            value: 1.0,
-            width: 32,
-        })),
+        PreprocessorError::UnexpectedToken(TokenValue::Float("1.0".to_string())),
     )
 }
 
@@ -1499,11 +1496,7 @@ fn parse_version() {
             assert_eq!(version.tokens.len(), 3);
             assert_eq!(
                 version.tokens[0].value,
-                TokenValue::Integer(Integer {
-                    value: 1,
-                    signed: true,
-                    width: 32
-                })
+                TokenValue::Integer("1".to_string())
             );
             assert_eq!(version.tokens[1].value, TokenValue::Punct(Punct::Semicolon));
             assert_eq!(version.tokens[2].value, TokenValue::Punct(Punct::LeftParen));
@@ -1794,12 +1787,14 @@ fn float_conditions_are_opt_in_and_use_expanded_macro_state() {
     let integers: Vec<_> = values
         .iter()
         .filter_map(|value| match value {
-            TokenValue::Integer(integer) => Some(integer.value),
+            TokenValue::Integer(integer) => {
+                Some(crate::token::parse_integer(integer).unwrap().value)
+            }
             _ => None,
         })
         .collect();
     assert_eq!(integers, [10, 20, 30]);
-    assert!(matches!(values.last(), Some(TokenValue::Float(float)) if float.value == 2.5));
+    assert!(matches!(values.last(), Some(TokenValue::Float(float)) if float == "2.5"));
     assert!(Preprocessor::new("#if 1.5\n10\n#endif").any(|item| item.is_err()));
 }
 
@@ -1854,7 +1849,7 @@ fn iris_ternaries_have_conditional_precedence_and_associativity() {
         pp.add_define("MC_VERSION", "12111").unwrap();
         let values: Vec<_> = pp.map(|item| item.unwrap().value).collect();
         assert!(
-            matches!(values.as_slice(), [TokenValue::Integer(value)] if value.value == 7),
+            matches!(values.as_slice(), [TokenValue::Integer(value)] if value == "7"),
             "{:?}",
             values
         );
@@ -1862,7 +1857,7 @@ fn iris_ternaries_have_conditional_precedence_and_associativity() {
     let mut pp = Preprocessor::new("#if 0\n9\n#elif 1 ? 1 : 0\n7\n#endif");
     pp.set_iris_conditions(true);
     let values: Vec<_> = pp.map(|item| item.unwrap().value).collect();
-    assert!(matches!(values.as_slice(), [TokenValue::Integer(value)] if value.value == 7));
+    assert!(matches!(values.as_slice(), [TokenValue::Integer(value)] if value == "7"));
     assert!(Preprocessor::new("#if 1 ? 1 : 0\n7\n#endif").any(|item| item.is_err()));
     for condition in ["1 ? 2", "1 ? : 3", "1 ? 2 3", "1 ? 2 :"].iter() {
         let source = format!("#if {}\n7\n#endif", condition);
@@ -1956,7 +1951,7 @@ fn macro_operands_keep_following_operators() {
                 .map(|token| token.unwrap().value)
                 .filter_map(|value| {
                     if let TokenValue::Integer(value) = value {
-                        Some(value.value)
+                        Some(crate::token::parse_integer(&value).unwrap().value)
                     } else {
                         None
                     }
@@ -1975,7 +1970,7 @@ fn generated_lines_keep_original_line_macros_and_explicit_offsets() {
     let values: Vec<_> = pp
         .map(Result::unwrap)
         .filter_map(|token| match token.value {
-            TokenValue::Integer(value) => Some(value.value),
+            TokenValue::Integer(value) => Some(crate::token::parse_integer(&value).unwrap().value),
             _ => None,
         })
         .collect();
@@ -2045,7 +2040,9 @@ fn inactive_groups_accept_nonconditional_payloads() {
             let values: Vec<_> = pp
                 .map(|token| token.unwrap().value)
                 .filter_map(|value| match value {
-                    TokenValue::Integer(value) => Some(value.value),
+                    TokenValue::Integer(value) => {
+                        Some(crate::token::parse_integer(&value).unwrap().value)
+                    }
                     _ => None,
                 })
                 .collect();
@@ -2067,7 +2064,7 @@ fn preserved_glsl_keeps_active_directive_comments_and_splices() {
             comments.push(token.text.clone());
         }
         if let Some(TokenValue::Integer(value)) = token.value {
-            values.push(value.value);
+            values.push(crate::token::parse_integer(&value).unwrap().value);
         }
     }
     assert_eq!(comments, ["/* kept */", "/* value */", "/* active */"]);

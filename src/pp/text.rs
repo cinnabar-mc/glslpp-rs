@@ -1,6 +1,7 @@
 use crate::lexer::TextMode;
 use crate::token::{Location, Punct, Token as PublicToken, TokenValue};
-use unicode_xid::UnicodeXID;
+use alloc::{borrow::ToOwned, format, string::String, vec::Vec};
+use unicode_ident::is_xid_continue;
 
 /// One preprocessed text fragment at its original invocation line.
 #[derive(Debug)]
@@ -93,8 +94,8 @@ impl Boundary {
             None => return false,
         };
         match self.class {
-            Class::Ident => first.is_xid_continue(),
-            Class::Number => first.is_xid_continue() || first == '.',
+            Class::Ident => is_xid_continue(first),
+            Class::Number => is_xid_continue(first) || first == '.',
             Class::Punct(punct) => match punct {
                 Punct::LeftAngle => matches!(first, '<' | '='),
                 Punct::RightAngle => matches!(first, '>' | '='),

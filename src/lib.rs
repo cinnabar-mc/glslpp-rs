@@ -1,4 +1,7 @@
-extern crate unicode_xid;
+#![no_std]
+
+extern crate alloc;
+extern crate hashbrown;
 
 #[allow(clippy::match_like_matches_macro)]
 mod lexer;

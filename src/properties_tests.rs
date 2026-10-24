@@ -1,4 +1,5 @@
 use crate::pp::Preprocessor;
+use alloc::string::String;
 
 /// A prepared properties input, environment, expected text, and registration outcome.
 type Case<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)], &'a str, bool);
