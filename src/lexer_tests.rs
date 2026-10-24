@@ -3,7 +3,8 @@ use super::lexer::{
     COMMENT_SENTINEL_VALUE,
 };
 use super::token::{Location, PreprocessorError, Punct};
-use alloc::string::ToString;
+use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -134,6 +135,39 @@ fn skip_backslash_newline() {
     // Test a case just before EOF
     let mut it = SkipBackslashNewline::new("\\\n");
     assert_eq!(it.next(), None);
+}
+
+#[test]
+fn flat_lexer_skipping_uses_bounded_stack() {
+    extern crate std;
+    std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(|| {
+            let input = alloc::format!("{}token", "\\\n".repeat(100_000));
+            let mut chars = SkipBackslashNewline::new(&input);
+            assert_eq!(chars.next(), c('t', 100_001));
+            assert_eq!(chars.count(), 4);
+            assert_eq!(lexed_token_values(&input), [make_ident("token")]);
+
+            let input = alloc::format!("// {}\ntoken", "\\\n".repeat(100_000));
+            assert_eq!(
+                lexed_token_values(&input),
+                [TokenValue::NewLine, make_ident("token")]
+            );
+
+            let input = alloc::format!("{}{}", " ".repeat(100_000), "token ".repeat(100_000));
+            assert_eq!(Lexer::new(&input).count(), 100_001);
+
+            // A splice must not remove the backslash-newline pair it creates.
+            let input = "\\\\\n\n";
+            assert_eq!(
+                SkipBackslashNewline::new(input).collect::<Vec<_>>(),
+                [('\\', 1), ('\n', 2)]
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[test]
@@ -269,6 +303,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: make_integer("1"),
             location: l(1, 0..1),
             leading_whitespace: true,
@@ -284,6 +319,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: make_integer("1"),
             location: l(1, 1..2),
             leading_whitespace: true,
@@ -295,6 +331,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: make_integer("2"),
             location: l(2, 7..8),
             leading_whitespace: true,
@@ -304,6 +341,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: make_integer("3"),
             location: l(2, 9..10),
             leading_whitespace: true,
@@ -314,6 +352,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: Punct::Plus.into(),
             location: l(2, 10..11),
             leading_whitespace: false,
@@ -324,6 +363,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: TokenValue::NewLine,
             location: l(2, 11..12),
             leading_whitespace: false,
@@ -334,6 +374,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: make_integer("4"),
             location: l(3, 12..13),
             leading_whitespace: true,
@@ -344,6 +385,7 @@ fn lex_metadata() {
     assert_eq!(
         unwrap_token(it.next()),
         Token {
+            text: String::new(),
             value: TokenValue::NewLine,
             location: l(3, 13..13),
             leading_whitespace: false,
@@ -762,3 +804,27 @@ fn lex_had_comments() {
 }
 
 // TODO test has_whitespace
+
+#[test]
+fn property_quotes_leave_the_newline_for_the_next_token() {
+    for quote in ['\'', '"'] {
+        for suffix in ["", "\\", "\\\\"] {
+            let source = format!("{quote}value{suffix}\n// comment\nnext");
+            let mut lexer = Lexer::new(&source);
+            lexer.set_preserve_text(true);
+            let quoted = lexer.next().unwrap().unwrap();
+            assert_eq!(
+                quoted.value,
+                TokenValue::Opaque(format!("{quote}value{suffix}"))
+            );
+            assert_eq!(quoted.location.end as usize, source.find('\n').unwrap());
+            assert_eq!(unwrap_token_value(lexer.next()), TokenValue::NewLine);
+            assert_eq!(unwrap_token_value(lexer.next()), TokenValue::Trivia);
+            assert_eq!(unwrap_token_value(lexer.next()), TokenValue::NewLine);
+            let next = lexer.next().unwrap().unwrap();
+            assert_eq!(next.value, TokenValue::Ident("next".into()));
+            assert!(next.start_of_line);
+            assert_eq!(next.location.line(), 3);
+        }
+    }
+}

@@ -9,6 +9,10 @@ pub mod pp;
 pub mod token;
 
 #[cfg(test)]
+mod differential_tests;
+#[cfg(test)]
 mod lexer_tests;
 #[cfg(test)]
 mod pp_tests;
+#[cfg(test)]
+mod properties_tests;

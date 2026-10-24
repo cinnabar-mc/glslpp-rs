@@ -1,5 +1,5 @@
 use crate::token::{Location, PreprocessorError, Punct};
-use alloc::string::String;
+use alloc::{borrow::ToOwned, string::String};
 use core::str::Chars;
 use unicode_ident::{is_xid_continue, is_xid_start};
 
@@ -80,12 +80,14 @@ impl Iterator for CharsAndLine<'_> {
 #[derive(Clone)]
 pub struct SkipBackslashNewline<'a> {
     inner: CharsAndLine<'a>,
+    preserve_text: bool,
 }
 
 impl<'a> SkipBackslashNewline<'a> {
     pub fn new(input: &'a str) -> Self {
         SkipBackslashNewline {
             inner: CharsAndLine::new(input),
+            preserve_text: false,
         }
     }
 
@@ -100,11 +102,11 @@ impl Iterator for SkipBackslashNewline<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         let mut current = self.inner.next()?;
 
-        while current.0 == '\\' {
+        while current.0 == '\\' && !self.preserve_text {
             let mut peek_inner = self.inner.clone();
             if let Some(('\n', _)) = peek_inner.next() {
                 self.inner = peek_inner;
-                current = self.next()?;
+                current = self.inner.next()?;
             } else {
                 return Some(current);
             }
@@ -123,6 +125,11 @@ impl Iterator for SkipBackslashNewline<'_> {
 #[derive(Clone)]
 pub struct ReplaceComments<'a> {
     inner: SkipBackslashNewline<'a>,
+    preserve_text: bool,
+    quote: Option<char>,
+    escaped: bool,
+    /// Whether the last returned character belongs to a quoted token.
+    quoted: bool,
 }
 
 // The lexer wants to know when whitespace is a comment to know if a comment was ever processed.
@@ -134,6 +141,10 @@ impl<'a> ReplaceComments<'a> {
     pub fn new(input: &'a str) -> Self {
         ReplaceComments {
             inner: SkipBackslashNewline::new(input),
+            preserve_text: false,
+            quote: None,
+            escaped: false,
+            quoted: false,
         }
     }
 
@@ -147,6 +158,29 @@ impl Iterator for ReplaceComments<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.inner.next()?;
+        self.quoted = false;
+        if self.preserve_text {
+            if current.0 == '\n' {
+                // Splicing has already happened. Every remaining newline ends quote state,
+                // including properties continuations, whose backslashes stay literal.
+                self.quote = None;
+                self.escaped = false;
+            } else if let Some(quote) = self.quote {
+                self.quoted = true;
+                if self.escaped {
+                    self.escaped = false;
+                } else if current.0 == '\\' {
+                    self.escaped = true;
+                } else if current.0 == quote {
+                    self.quote = None;
+                }
+                return Some(current);
+            }
+            if matches!(current.0, '\'' | '"') {
+                self.quote = Some(current.0);
+                self.quoted = true;
+            }
+        }
 
         if current.0 != '/' {
             debug_assert!(current.0 != COMMENT_SENTINEL_VALUE);
@@ -200,6 +234,8 @@ struct LexerCharIterator<'a> {
     peeked: Option<(CharAndLine, *const u8)>,
     last_consumed: (CharAndLine, *const u8),
     input_start: *const u8,
+    consumed_end: *const u8,
+    peeked_end: *const u8,
 }
 
 pub const NONE_CONSUMED_SENTINEL_VALUE: char = '\r';
@@ -211,14 +247,21 @@ impl<'a> LexerCharIterator<'a> {
             peeked: None,
             last_consumed: ((NONE_CONSUMED_SENTINEL_VALUE, 0), input.as_bytes().as_ptr()),
             input_start: input.as_bytes().as_ptr(),
+            consumed_end: input.as_ptr(),
+            peeked_end: input.as_ptr(),
         }
     }
     fn next_char(&mut self) -> Option<char> {
         self.last_consumed = match self.peeked.take() {
-            Some(v) => v,
+            Some(v) => {
+                self.consumed_end = self.peeked_end;
+                v
+            }
             None => {
                 let ptr = self.inner.get_current_ptr();
-                (self.inner.next()?, ptr)
+                let value = self.inner.next()?;
+                self.consumed_end = self.inner.get_current_ptr();
+                (value, ptr)
             }
         };
         Some(self.last_consumed.0 .0)
@@ -230,9 +273,21 @@ impl<'a> LexerCharIterator<'a> {
             None => {
                 let ptr = self.inner.get_current_ptr();
                 let next = self.inner.next()?;
+                self.peeked_end = self.inner.get_current_ptr();
                 self.peeked = Some((next, ptr));
                 Some(next.0)
             }
+        }
+    }
+
+    /// Consumes a character only when the shared quote scanner includes it in this token.
+    fn next_quoted_char(&mut self) -> Option<char> {
+        self.inner.quote?;
+        self.peek_char()?;
+        if self.inner.quoted {
+            self.next_char()
+        } else {
+            None
         }
     }
 
@@ -256,6 +311,8 @@ pub enum TokenValue {
     // Preprocessor specific token values
     Hash,
     NewLine,
+    Trivia,
+    Opaque(String),
 
     // Regular token values
     Ident(String),
@@ -276,10 +333,22 @@ pub struct Token {
     pub location: Location,
     pub leading_whitespace: bool,
     pub start_of_line: bool,
+    pub text: String,
 }
 
 pub type LexerItem = Result<Token, (PreprocessorError, Location)>;
+/// Chooses strict tokens, literal properties, or preserved GLSL source.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextMode {
+    Tokens,
+    Properties,
+    Glsl,
+}
+
 pub struct Lexer<'a> {
+    source: &'a str,
+    mode: TextMode,
+    skipping: bool,
     inner: LexerCharIterator<'a>,
     leading_whitespace: bool,
     start_of_line: bool,
@@ -290,10 +359,44 @@ impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Self {
         // TODO bail out on source that is too large.
         Lexer {
+            source: input,
+            mode: TextMode::Tokens,
+            skipping: false,
             inner: LexerCharIterator::new(input),
             leading_whitespace: true,
             start_of_line: true,
             had_comments: false,
+        }
+    }
+
+    /// Preserves properties with their literal punctuation and physical continuations.
+    pub(crate) fn set_preserve_text(&mut self, preserve: bool) {
+        self.set_text_mode(if preserve {
+            TextMode::Properties
+        } else {
+            TextMode::Tokens
+        });
+    }
+
+    /// Selects source preservation without changing GLSL splicing or token validation.
+    pub(crate) fn set_text_mode(&mut self, mode: TextMode) {
+        self.mode = mode;
+        self.inner.inner.inner.preserve_text = mode == TextMode::Properties;
+        self.set_skipping(self.skipping);
+    }
+
+    /// Reports the lexical policy used for environment macro definitions too.
+    pub(crate) fn text_mode(&self) -> TextMode {
+        self.mode
+    }
+
+    /// Makes skipped text opaque without allowing an unmatched quote to consume later lines.
+    pub(crate) fn set_skipping(&mut self, skipping: bool) {
+        self.skipping = skipping;
+        self.inner.inner.preserve_text = self.mode != TextMode::Tokens || skipping;
+        if self.mode != TextMode::Properties && skipping {
+            self.inner.inner.quote = None;
+            self.inner.inner.escaped = false;
         }
     }
 
@@ -310,7 +413,7 @@ impl<'a> Lexer<'a> {
             identifier.push(c);
         }
 
-        let rest = self.consume_chars(|c| is_xid_continue(c));
+        let rest = self.consume_chars(is_xid_continue);
         identifier.push_str(&rest);
 
         // TODO check if identifier is larger than the limit.
@@ -332,6 +435,18 @@ impl<'a> Lexer<'a> {
             result.push(c);
         }
         result
+    }
+
+    /// Keeps numeric suffixes together in properties so macros cannot expand inside them.
+    fn parse_number_token(&mut self, first_char: char) -> Result<TokenValue, PreprocessorError> {
+        let value = self.parse_number(first_char);
+        if self.mode == TextMode::Properties && self.inner.peek_char().is_some_and(is_xid_continue)
+        {
+            self.consume_chars(is_xid_continue);
+            Ok(TokenValue::Opaque(String::new()))
+        } else {
+            value
+        }
     }
 
     fn parse_number(&mut self, first_char: char) -> Result<TokenValue, PreprocessorError> {
@@ -512,6 +627,17 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// Replaces comments that could splice again with the same newlines and one space.
+fn normalize_comment(text: String) -> String {
+    if text.contains("\\\n") || text.ends_with('\\') {
+        let mut replacement = String::from(" ");
+        replacement.extend(text.chars().filter(|&ch| ch == '\n'));
+        replacement
+    } else {
+        text
+    }
+}
+
 impl Iterator for Lexer<'_> {
     type Item = LexerItem;
 
@@ -537,7 +663,11 @@ impl Iterator for Lexer<'_> {
                     self.start_of_line = was_start_of_line;
                     self.leading_whitespace = true;
                     self.inner.next_char();
-                    continue;
+                    if self.mode != TextMode::Tokens {
+                        Ok(TokenValue::Trivia)
+                    } else {
+                        continue;
+                    }
                 }
                 '\n' => {
                     self.leading_whitespace = true;
@@ -546,9 +676,17 @@ impl Iterator for Lexer<'_> {
                     Ok(TokenValue::NewLine)
                 }
 
+                '\'' | '"' if self.mode == TextMode::Properties || self.skipping => {
+                    // The opening quote may have been peeked before tolerant lexing started.
+                    self.inner.inner.quote = Some(current_char);
+                    self.inner.inner.escaped = false;
+                    self.inner.next_char();
+                    while self.inner.next_quoted_char().is_some() {}
+                    Ok(TokenValue::Opaque(String::new()))
+                }
                 c @ '0'..='9' => {
                     self.inner.next_char();
-                    self.parse_number(c)
+                    self.parse_number_token(c)
                 }
 
                 // Special case . as a punctuation because it can be the start of a float.
@@ -556,7 +694,7 @@ impl Iterator for Lexer<'_> {
                     self.inner.next_char();
 
                     match self.inner.peek_char() {
-                        Some('0'..='9') => self.parse_number('.'),
+                        Some('0'..='9') => self.parse_number_token('.'),
                         _ => Ok(TokenValue::Punct(Punct::Dot)),
                     }
                 }
@@ -565,18 +703,63 @@ impl Iterator for Lexer<'_> {
                     if is_xid_start(current_char) || current_char == '_' {
                         self.parse_identifier()
                     } else {
-                        self.parse_punctuation()
+                        let saved = self.inner.clone();
+                        match self.parse_punctuation() {
+                            Err(_) if self.mode == TextMode::Properties || self.skipping => {
+                                self.inner = saved;
+                                self.inner.next_char();
+                                Ok(TokenValue::Opaque(String::new()))
+                            }
+                            result => result,
+                        }
                     }
                 }
             };
 
-            location.end = self.inner.get_last_consumed_end_offset() as u32;
+            location.end = if self.mode != TextMode::Tokens {
+                (self.inner.consumed_end as usize - self.inner.input_start as usize) as u32
+            } else {
+                self.inner.get_last_consumed_end_offset() as u32
+            };
+            let mut text: String = if self.mode != TextMode::Tokens {
+                if self.mode == TextMode::Glsl {
+                    SkipBackslashNewline::new(
+                        &self.source[location.start as usize..location.end as usize],
+                    )
+                    .map(|(ch, _)| ch)
+                    .collect()
+                } else {
+                    self.source[location.start as usize..location.end as usize].to_owned()
+                }
+            } else {
+                String::new()
+            };
+            if self.mode == TextMode::Glsl && current_char == COMMENT_SENTINEL_VALUE {
+                text = normalize_comment(text);
+            }
+            let value = match value {
+                Ok(TokenValue::Trivia)
+                    if self.mode == TextMode::Properties
+                        && text.starts_with("/*")
+                        && (text.len() < 4 || !text.ends_with("*/")) =>
+                {
+                    Ok(TokenValue::Opaque(text.clone()))
+                }
+                Ok(TokenValue::Opaque(ref value)) if value.is_empty() => {
+                    Ok(TokenValue::Opaque(text.clone()))
+                }
+                Err(_) if self.mode == TextMode::Properties || self.skipping => {
+                    Ok(TokenValue::Opaque(text.clone()))
+                }
+                value => value,
+            };
 
             return Some(value.map_err(|e| (e, Default::default())).map(|t| Token {
                 value: t,
                 location,
                 leading_whitespace: had_leading_whitespace,
                 start_of_line: was_start_of_line,
+                text,
             }));
         }
 
@@ -595,6 +778,11 @@ impl Iterator for Lexer<'_> {
                 },
                 leading_whitespace: self.leading_whitespace,
                 start_of_line: false,
+                text: if self.mode != TextMode::Tokens {
+                    "\n".to_owned()
+                } else {
+                    String::new()
+                },
             }))
         } else {
             None

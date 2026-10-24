@@ -1,15 +1,75 @@
 use crate::token::{parse_integer, PreprocessorError, Punct};
 
 use super::{Define, Location, MacroProcessor, MeLexer, Step, StepExit, Token, TokenValue};
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
-use alloc::vec::Vec;
-use alloc::{rc::Rc, vec};
-use core::convert::TryInto;
+use alloc::vec::{self, Vec};
+use core::{cell::Cell, convert::TryInto};
 use hashbrown::HashMap;
+
+/// Maximum recursive expression nesting before returning an error.
+const MAX_EXPRESSION_DEPTH: usize = 64;
+
+/// Converts a condition literal using JCPP's signed integer part and exponent scaling.
+/// Fractions and type suffixes do not affect the value. Integer parts must fit in i64.
+fn iris_number(number: &str, float: bool) -> Result<i64, PreprocessorError> {
+    let number = if float {
+        number.trim_end_matches(['l', 'L', 'f', 'F'])
+    } else {
+        number.trim_end_matches(['u', 'U', 'l', 'L'])
+    };
+    if !float {
+        let (digits, radix) = if number.starts_with("0x") || number.starts_with("0X") {
+            (&number[2..], 16)
+        } else if number.starts_with('0') {
+            (number, 8)
+        } else {
+            (number, 10)
+        };
+        return i64::from_str_radix(digits, radix).map_err(|_| PreprocessorError::IntegerOverflow);
+    }
+
+    let (mantissa, exponent) = match number.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            Some(
+                exponent
+                    .parse::<i32>()
+                    .map_err(|_| PreprocessorError::IntegerOverflow)?,
+            ),
+        ),
+        None => (number, None),
+    };
+    let integer = mantissa.split('.').next().unwrap_or_default();
+    let value = if integer.is_empty() {
+        0
+    } else {
+        integer
+            .parse::<i64>()
+            .map_err(|_| PreprocessorError::IntegerOverflow)?
+    };
+    let Some(exponent) = exponent else {
+        return Ok(value);
+    };
+    // Outside this range every nonzero signed integer either saturates or truncates to zero.
+    if value == 0 || exponent < -18 {
+        return Ok(0);
+    }
+    if exponent > 18 {
+        return Ok(i64::MAX);
+    }
+    let scale = format!("1e{}", exponent)
+        .parse::<f64>()
+        .map_err(|_| PreprocessorError::FloatParsingError)?;
+    Ok((value as f64 * scale) as i64)
+}
 
 struct IfLexer<'macros> {
     tokens: vec::IntoIter<Token>,
     defines: &'macros HashMap<String, Rc<Define>>,
+    work: &'macros Cell<u64>,
 }
 
 pub(super) struct IfParser<'macros> {
@@ -18,56 +78,81 @@ pub(super) struct IfParser<'macros> {
     location: Location,
 
     parsing_if: bool,
+    iris_conditions: bool,
     carry: Option<Token>,
+    expression_depth: usize,
 }
 
 impl<'macros> IfParser<'macros> {
     /// Builds a new IfParser that can be reused
     ///
     /// `parsing_if` indicates wether or not non defined macros should be
-    /// replaced with 0
+    /// replaced with 0. `iris_conditions` enables float truncation and ternaries.
     pub fn new(
         tokens: Vec<Token>,
         defines: &'macros HashMap<String, Rc<Define>>,
+        work: &'macros Cell<u64>,
         location: Location,
         parsing_if: bool,
+        iris_conditions: bool,
     ) -> Self {
         IfParser {
             lexer: IfLexer {
                 tokens: tokens.into_iter(),
                 defines,
+                work,
             },
             macro_processor: MacroProcessor::default(),
             location,
 
             parsing_if,
+            iris_conditions,
             carry: None,
+            expression_depth: 0,
         }
     }
 
-    /// Helper method to consume the next token without define expansion
-    fn raw_next(&mut self) -> Option<Token> {
-        self.carry
-            .take()
-            .or_else(|| self.macro_processor.step(&mut self.lexer).ok())
+    /// Reads a validated token without starting a new macro invocation.
+    /// All expression tokens, including unexpanded `defined` operands, pass through here.
+    fn unexpanded_next(&mut self) -> Step<Option<Token>> {
+        let token = if let Some(token) = self.carry.take() {
+            token
+        } else {
+            loop {
+                match self.macro_processor.step(&mut self.lexer) {
+                    Ok(token) if token.trivia => continue,
+                    Ok(token) => break token,
+                    Err(StepExit::Continue) => continue,
+                    Err(StepExit::Finished) => return Ok(None),
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        if token.opaque {
+            return Err(StepExit::Error((
+                PreprocessorError::UnexpectedToken(token.value),
+                token.location,
+            )));
+        }
+        Ok(Some(token))
     }
 
     /// Helper method to consume the next token with define expansion
     fn next(&mut self) -> Step<Option<Token>> {
-        let token = match self.raw_next() {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-
-        Ok(match token.value {
-            TokenValue::Ident(ref name) if name != "defined" => {
-                match self.add_define(name, token.location)? {
-                    Some(t) => Some(t),
-                    None => self.next()?,
+        loop {
+            let token = match self.unexpanded_next()? {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            match token.value {
+                TokenValue::Ident(ref name) if name != "defined" => {
+                    if let Some(token) = self.add_define(name, token.location)? {
+                        return Ok(Some(token));
+                    }
                 }
+                _ => return Ok(Some(token)),
             }
-            _ => Some(token),
-        })
+        }
     }
 
     /// Helper method to get the next token with define expansion
@@ -79,8 +164,8 @@ impl<'macros> IfParser<'macros> {
     /// Helper method to consume the next token without define expansion
     ///
     /// Returns an EOI error if there are no further tokens
-    fn expect_raw_next(&mut self) -> Step<Token> {
-        self.raw_next().ok_or(StepExit::Error((
+    fn expect_unexpanded_next(&mut self) -> Step<Token> {
+        self.unexpanded_next()?.ok_or(StepExit::Error((
             PreprocessorError::UnexpectedEndOfInput,
             self.location,
         )))
@@ -107,16 +192,19 @@ impl<'macros> IfParser<'macros> {
     }
 
     fn add_define(&mut self, name: &str, location: Location) -> Step<Option<Token>> {
-        if self
-            .macro_processor
-            .start_define_invocation(name, location, &mut self.lexer)?
-        {
+        if self.macro_processor.start_define_invocation(
+            name,
+            location,
+            location,
+            &mut self.lexer,
+        )? {
             Ok(None)
         } else if self.parsing_if {
-            Ok(Some(Token {
-                value: TokenValue::Integer("0".to_string()),
+            Ok(Some(Token::generated(
+                TokenValue::Integer("0".to_owned()),
                 location,
-            }))
+                "0".to_owned(),
+            )))
         } else {
             Err(StepExit::Error((
                 PreprocessorError::UnexpectedToken(TokenValue::Ident(name.to_string())),
@@ -126,12 +214,12 @@ impl<'macros> IfParser<'macros> {
     }
 
     fn handle_defined(&mut self) -> Step<i64> {
-        let next = self.expect_raw_next()?;
+        let next = self.expect_unexpanded_next()?;
 
         match next.value {
             TokenValue::Ident(ref name) => Ok(self.lexer.defines.get(name).is_some() as i64),
             TokenValue::Punct(Punct::LeftParen) => {
-                let name_token = self.expect_raw_next()?;
+                let name_token = self.expect_unexpanded_next()?;
                 let name = match name_token.value {
                     TokenValue::Ident(name) => Ok(name),
                     value => Err(StepExit::Error((
@@ -168,13 +256,17 @@ impl<'macros> IfParser<'macros> {
 
                 self.handle_defined()
             }
-            TokenValue::Integer(int) => match parse_integer(&int) {
-                Ok(i) => Ok(i.value as i64),
-                Err(err) => Err(StepExit::Error((err, token.location))),
-            },
-
+            TokenValue::Integer(ref number) | TokenValue::Float(ref number)
+                if self.iris_conditions =>
+            {
+                iris_number(number, matches!(token.value, TokenValue::Float(_)))
+                    .map_err(|error| StepExit::Error((error, token.location)))
+            }
+            TokenValue::Integer(int) => parse_integer(&int)
+                .map(|value| value.value as i64)
+                .map_err(|error| StepExit::Error((error, token.location))),
             TokenValue::Punct(Punct::LeftParen) => {
-                let val = self.parse_logical_or()?;
+                let val = self.nested(Self::parse_conditional)?;
 
                 let close_brace = self.expect_next()?;
 
@@ -199,11 +291,14 @@ impl<'macros> IfParser<'macros> {
                 Punct::Plus | Punct::Minus | Punct::Bang | Punct::Tilde => {
                     self.next()?;
 
-                    let val = self.parse_unary()?;
+                    let val = self.nested(Self::parse_unary)?;
 
                     Ok(match punct {
                         Punct::Plus => val,
-                        Punct::Minus => -val,
+                        Punct::Minus => val.checked_neg().ok_or(StepExit::Error((
+                            PreprocessorError::IntegerOverflow,
+                            self.location,
+                        )))?,
                         Punct::Bang => (val == 0) as i64,
                         Punct::Tilde => !val,
                         _ => unreachable!(),
@@ -441,8 +536,51 @@ impl<'macros> IfParser<'macros> {
         Ok(left)
     }
 
+    /// Parses one nested expression without exceeding the stack-depth budget.
+    fn nested(&mut self, parse: fn(&mut Self) -> Step<i64>) -> Step<i64> {
+        if self.expression_depth >= MAX_EXPRESSION_DEPTH {
+            return Err(StepExit::Error((
+                PreprocessorError::RecursionLimitReached,
+                self.location,
+            )));
+        }
+        self.expression_depth += 1;
+        let result = parse(self);
+        self.expression_depth -= 1;
+        result
+    }
+
+    /// Parses the low-precedence, right-associative Iris conditional operator.
+    fn parse_conditional(&mut self) -> Step<i64> {
+        let condition = self.parse_logical_or()?;
+        if !self.iris_conditions
+            || !matches!(
+                self.peek()?.map(|token| token.value),
+                Some(TokenValue::Punct(Punct::Question))
+            )
+        {
+            return Ok(condition);
+        }
+        self.next()?;
+        let when_true = self.nested(Self::parse_conditional)?;
+        let colon = self.expect_next()?;
+        if colon.value != TokenValue::Punct(Punct::Colon) {
+            return Err(StepExit::Error((
+                PreprocessorError::UnexpectedToken(colon.value),
+                colon.location,
+            )));
+        }
+        let when_false = self.nested(Self::parse_conditional)?;
+        Ok(if condition != 0 {
+            when_true
+        } else {
+            when_false
+        })
+    }
+
+    /// Evaluates one preprocessor expression using the configured condition dialect.
     pub fn evaluate_expression(&mut self) -> Step<i64> {
-        self.parse_logical_or()
+        self.parse_conditional()
     }
 }
 
@@ -457,5 +595,9 @@ impl MeLexer for IfLexer<'_> {
 
     fn apply_line_offset(&self, line: u32, _: Location) -> Step<u32> {
         Ok(line)
+    }
+
+    fn charge(&self, location: Location) -> Step<()> {
+        super::charge_work(self.work, location)
     }
 }
