@@ -174,6 +174,9 @@ fn recovered_conditional_tails_are_opaque_and_restore_branch_state() {
                     ("OFF ", if directive == "ifndef" { "yes" } else { "no" }),
                     ("\n", "yes"),
                     ("1 ", "yes"),
+                    ("ON", if directive == "ifdef" { "yes" } else { "no" }),
+                    ("OFF", if directive == "ifndef" { "yes" } else { "no" }),
+                    ("1", "yes"),
                 ] {
                     let source = format!(
                         "#define ON\n#{directive} {operand}{tail}\nyes\n#else\nno\n#endif\nafter\n"
@@ -238,6 +241,30 @@ fn discarded_directive_tails_share_tolerant_skipping() {
             let mut pp = preprocessor_in_mode(source, mode);
             pp.set_iris_recovery(true);
             assert!(semantic_values(&mut pp).is_empty());
+        }
+    }
+}
+
+#[test]
+fn skipped_adjacent_quotes_keep_comment_delimiters_opaque() {
+    for mode in [
+        lexer::TextMode::Tokens,
+        lexer::TextMode::Glsl,
+        lexer::TextMode::Properties,
+    ] {
+        for prefix in ["x", "1", "_", "0x1", "()"] {
+            for quote in ["\"/*\"", "'/*'", "\"//\"", "'//'"] {
+                let source = format!("#if 0\n{prefix}{quote}\n#endif\nvisible\n");
+                for recovery in [false, true] {
+                    let mut pp = preprocessor_in_mode(&source, mode);
+                    pp.set_iris_recovery(recovery);
+                    assert_eq!(
+                        semantic_values(&mut pp),
+                        [TokenValue::Ident("visible".into())],
+                        "{source}"
+                    );
+                }
+            }
         }
     }
 }

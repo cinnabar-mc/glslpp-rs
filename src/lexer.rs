@@ -677,6 +677,9 @@ impl Iterator for Lexer<'_> {
                 }
 
                 '\'' | '"' if self.mode == TextMode::Properties || self.skipping => {
+                    // The opening quote may have been peeked before tolerant lexing started.
+                    self.inner.inner.quote = Some(current_char);
+                    self.inner.inner.escaped = false;
                     self.inner.next_char();
                     while self.inner.next_quoted_char().is_some() {}
                     Ok(TokenValue::Opaque(String::new()))
