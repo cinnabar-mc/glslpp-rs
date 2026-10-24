@@ -2,6 +2,135 @@ use super::lexer::{self, Token as LexerToken, TokenValue as LexerTokenValue};
 use super::pp::{convert_lexer_token, Preprocessor, PreprocessorItem};
 use super::token::{Float, Integer, Location, PreprocessorError, Punct, Token, TokenValue};
 
+/// Collects rendered text and semantic values from either preservation mode.
+fn preserved_output(source: &str, glsl: bool) -> (String, Vec<TokenValue>) {
+    let mut pp = Preprocessor::new(source);
+    if glsl {
+        pp.set_preserve_glsl_text();
+    } else {
+        pp.set_preserve_text(true);
+    }
+    let mut text = String::new();
+    let mut values = Vec::new();
+    while let Some(token) = pp.next_text() {
+        let token = token.unwrap();
+        text.push_str(&token.text);
+        values.extend(token.value);
+    }
+    (text, values)
+}
+
+/// Collects semantic values using ordinary preprocessing.
+fn preprocessed_values(source: &str) -> Vec<TokenValue> {
+    Preprocessor::new(source)
+        .map(|token| token.unwrap().value)
+        .collect()
+}
+
+#[test]
+fn preserved_macro_invocations_ignore_trivia() {
+    let source = "#define F(x) x\n#define Z() 7\nF (1) F/*gap*/(2) F\n(3) Z( ) Z(/*empty*/)\nF /* keep */ + 4;\nF /* trailing */";
+    let expected = preprocessed_values("1 2 3 7 7 F + 4; F");
+    for glsl in [false, true] {
+        let (text, values) = preserved_output(source, glsl);
+        assert_eq!(values, expected);
+        assert!(text.contains("F /* keep */ + 4;"), "{}", text);
+        assert!(text.contains("F /* trailing */"), "{}", text);
+    }
+}
+
+#[test]
+fn preserved_trivia_does_not_change_directive_metadata() {
+    for prefix in ["  ", "\t/* before */ ", "// before\n", "/* before\n */"] {
+        let source = format!(
+            "{}#version 450\n  /* gap */ #extension GL_EXT_test : enable\n",
+            prefix
+        );
+        let expected = preprocessed_values(&source);
+        assert!(matches!(&expected[0], TokenValue::Version(version) if version.is_first_directive));
+        assert!(
+            matches!(&expected[1], TokenValue::Extension(extension) if !extension.has_non_directive_before)
+        );
+        for glsl in [false, true] {
+            assert_eq!(preserved_output(&source, glsl).1, expected, "{}", source);
+        }
+    }
+}
+
+#[test]
+fn preserved_output_separates_comment_and_token_boundaries() {
+    for source in [
+        "#define DIV /\n4 DIV/*c*/2;",
+        "#define DIV /\n4 DIV/2;",
+        "#define DIV /\n4 DIV*2;",
+        "#define PLUS +\n1 PLUS+2;",
+        "#define NAME() foo\nNAME()bar;",
+        "#define NUM() 1\nNUM().0;",
+        "#define NUM() 1\nNUM()e;",
+    ] {
+        let expected = preprocessed_values(source);
+        for glsl in [false, true] {
+            let (text, values) = preserved_output(source, glsl);
+            assert_eq!(values, expected, "{}", source);
+            assert_eq!(preprocessed_values(&text), expected, "{}", text);
+        }
+    }
+}
+
+#[test]
+fn preservation_modes_have_identical_preprocessing_results() {
+    for source in [
+        "#define F(x) x\nF (1) F/*gap*/(2) F\n(3)",
+        "#define F() 7\nF( ) F(/*empty*/) F(\n)",
+        "#define F(x) x\nF /* keep */ + 1;\nF /* trailing */",
+        "#define F(x) x\n#define A F\nA /* call */(4) F(F (5))",
+        "  #version 450\n  #extension GL_EXT_test : enable\n#pragma optimize(on)\n",
+        "/* before */ #version 450\n/* gap */ #extension GL_EXT_test : enable\n",
+        "int x;\n#version 450\n#extension GL_EXT_test : enable\n",
+        "#define DIV /\n4 DIV/*c*/2; 4 DIV/2; 4 DIV*2;",
+        "#define PLUS +\n1 PLUS+2;\n#define NUM() 1\nNUM().0; NUM()e;",
+        "#if 0\n#error It's skipped\n@ 'bad\n#else\n7\n#endif\n",
+    ] {
+        let expected = preprocessed_values(source);
+        for glsl in [false, true] {
+            let (text, values) = preserved_output(source, glsl);
+            assert_eq!(values, expected, "{}", source);
+            let rendered_values: Vec<_> = expected
+                .iter()
+                .filter(|value| {
+                    !matches!(
+                        value,
+                        TokenValue::Version(_) | TokenValue::Extension(_) | TokenValue::Pragma(_)
+                    )
+                })
+                .cloned()
+                .collect();
+            assert_eq!(preprocessed_values(&text), rendered_values, "{}", text);
+        }
+    }
+}
+
+#[test]
+fn preserved_line_macros_match_token_mode() {
+    let source = "#define F(x) x\n#line 80\nF (__LINE__);";
+    let expected = preprocessed_values(source);
+    for glsl in [false, true] {
+        assert_eq!(preserved_output(source, glsl).1, expected);
+    }
+}
+
+#[test]
+fn preserved_glsl_splices_all_normalized_newlines() {
+    for newline in ["\n", "\r", "\r\n", "\n\r"] {
+        let source = format!("int va\\{}lue = 1;\n", newline);
+        let expected = preprocessed_values(&source);
+        let (text, values) = preserved_output(&source, true);
+        assert_eq!(values, expected);
+        assert_eq!(text, "int value = 1;\n");
+        assert_eq!(preprocessed_values(&text), expected);
+    }
+}
+
 #[test]
 fn text_output_preserves_literals_comments_and_macro_boundaries() {
     let source = "#define NEG -1\n#if -NEG > 0\nvalue=NEG \\\n\"NEG\" /* NEG\n#if 0\n*/\nafter=0.50\n#endif\n";
@@ -1420,14 +1549,14 @@ fn add_define() {
     );
 
     // Test some crashes detected by fuzzing
-    let mut pp = Preprocessor::new("#ifG/fp");
-    while let Some(_) = pp.next() {}
+    let pp = Preprocessor::new("#ifG/fp");
+    for _ in pp {}
 
-    let mut pp = Preprocessor::new("\n#if~O%t");
-    while let Some(_) = pp.next() {}
+    let pp = Preprocessor::new("\n#if~O%t");
+    for _ in pp {}
 
-    let mut pp = Preprocessor::new("#if~f>>~f");
-    while let Some(_) = pp.next() {}
+    let pp = Preprocessor::new("#if~f>>~f");
+    for _ in pp {}
 }
 
 #[test]
@@ -1505,7 +1634,7 @@ fn condition_nesting_returns_an_error_in_both_modes() {
 
 #[test]
 fn iris_ternaries_have_conditional_precedence_and_associativity() {
-    for (condition, expected) in [
+    for &(condition, expected) in [
         ("MC_VERSION >= 12100 ? 1 : 0", 1),
         ("0 ? 2 : 0 ? 3 : 4", 4),
         ("1 ? 0 ? 3 : 4 : 5", 4),
@@ -1513,7 +1642,6 @@ fn iris_ternaries_have_conditional_precedence_and_associativity() {
         ("0 ? 2 : 1.5", 1),
     ]
     .iter()
-    .copied()
     {
         let source = format!("#if ({}) == {}\n7\n#else\n9\n#endif", condition, expected);
         let mut pp = Preprocessor::new(&source);

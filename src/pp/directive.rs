@@ -236,7 +236,7 @@ impl<'a> DirectiveProcessor<'a> {
 
         // Defines are allowed to be redefined if they are exactly the same up to token locations.
         if let Some(previous_define) = self.defines.get(&define.name) {
-            if legal_redefinition(&*previous_define, &define) {
+            if legal_redefinition(previous_define, &define) {
                 Ok(())
             } else {
                 Err(StepExit::Error((
@@ -708,7 +708,9 @@ impl<'a> MeLexer for DirectiveProcessor<'a> {
 
                 _ => {
                     if !self.skipping {
-                        self.had_non_directive_token = true;
+                        if lexer_token.value != LexerTokenValue::Trivia {
+                            self.had_non_directive_token = true;
+                        }
                         convert_lexer_token_to_step(lexer_token)
                     } else {
                         Continue.into()

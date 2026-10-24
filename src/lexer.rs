@@ -192,7 +192,7 @@ impl<'a> Iterator for ReplaceComments<'a> {
             // The /*, consume until the next */
             Some(('*', _)) => {
                 let mut was_star = false;
-                while let Some((next, _)) = peek_inner.next() {
+                for (next, _) in peek_inner.by_ref() {
                     if was_star && next == '/' {
                         break;
                     }
@@ -449,7 +449,7 @@ impl<'a> Lexer<'a> {
                 Some('x') | Some('X') => {
                     self.inner.next_char();
 
-                    raw += &self.consume_chars(|c| matches!(c, '0'..='9' | 'a'..='f' | 'A'..='F'));
+                    raw += &self.consume_chars(|c| c.is_ascii_hexdigit());
                     integer_radix = 16;
                 }
 
@@ -467,7 +467,7 @@ impl<'a> Lexer<'a> {
             is_float = true;
         } else {
             // Parse any digits at the end of integers, or for the non-fractional part of floats.
-            raw += &self.consume_chars(|c| ('0'..='9').contains(&c));
+            raw += &self.consume_chars(|c| c.is_ascii_digit());
 
             if self.next_char_if(|c| c == '.').is_some() {
                 raw.push('.');
@@ -478,7 +478,7 @@ impl<'a> Lexer<'a> {
         // At this point either we're an integer missing only suffixes, or we're a float with
         // everything up to the . consumed.
         if is_float {
-            raw += &self.consume_chars(|c| ('0'..='9').contains(&c));
+            raw += &self.consume_chars(|c| c.is_ascii_digit());
         }
 
         // Handle scientific notation with a (e|E)(+|-|)\d+ suffix when we're a float or an
@@ -503,7 +503,7 @@ impl<'a> Lexer<'a> {
             }
 
             // TODO: what should we do when there is no number after the exponent?
-            raw += &self.consume_chars(|c| ('0'..='9').contains(&c));
+            raw += &self.consume_chars(|c| c.is_ascii_digit());
         }
 
         if is_float {
@@ -708,7 +708,11 @@ impl<'a> Iterator for Lexer<'a> {
             };
             let text = if self.mode != TextMode::Tokens {
                 if self.mode == TextMode::Glsl {
-                    self.source[location.start as usize..location.end as usize].replace("\\\n", "")
+                    SkipBackslashNewline::new(
+                        &self.source[location.start as usize..location.end as usize],
+                    )
+                    .map(|(ch, _)| ch)
+                    .collect()
                 } else {
                     self.source[location.start as usize..location.end as usize].to_owned()
                 }

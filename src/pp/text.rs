@@ -1,4 +1,4 @@
-use crate::lexer::{Lexer, TokenValue as LexerValue};
+use crate::lexer::Lexer;
 use crate::token::{Location, Token as PublicToken, TokenValue};
 
 /// One preprocessed text fragment at its original invocation line.
@@ -82,18 +82,14 @@ impl Output {
     }
 }
 
-/// Reports whether adjacent spellings would become a single preprocessing token.
+/// Reports whether a token or comment would cross the fragment boundary.
 fn joins_tokens(left: &str, right: &str) -> bool {
     let text = format!("{}{}", left, right);
     let mut lexer = Lexer::new(&text);
     lexer.set_preserve_text(true);
-    let mut tokens = lexer.filter_map(|token| match token {
-        Ok(token) if !matches!(token.value, LexerValue::Trivia | LexerValue::NewLine) => {
-            Some(token)
-        }
-        _ => None,
-    });
-    tokens
-        .next()
-        .is_some_and(|token| token.location.end as usize > left.len())
+    match lexer.next() {
+        Some(Ok(token)) => token.location.end as usize > left.len(),
+        Some(Err(_)) => true,
+        None => false,
+    }
 }

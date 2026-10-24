@@ -3,7 +3,7 @@ use crate::token::*;
 use std::{
     cell::Cell,
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     convert::TryFrom,
     rc::Rc,
 };
@@ -162,7 +162,7 @@ struct MacroProcessor {
     define_invocations: Vec<DefineInvocation>,
     defines_being_expanded: HashSet<String>,
 
-    peeked: Option<Step<Token>>,
+    peeked: VecDeque<Step<Token>>,
     define_line: u32,
 }
 
@@ -200,7 +200,14 @@ impl MacroProcessor {
             }
 
             if invocation.define.function_like {
-                let lparen_location = match self.step_no_continue(lexer) {
+                let mut trivia = Vec::new();
+                let next = loop {
+                    match self.step_no_continue(lexer) {
+                        Ok(token) if token.trivia => trivia.push(token),
+                        token => break token,
+                    }
+                };
+                let lparen_location = match next {
                     Ok(Token {
                         value: TokenValue::Punct(Punct::LeftParen),
                         location,
@@ -209,7 +216,10 @@ impl MacroProcessor {
 
                     // Function-like macros are not processed if there is no ( right after the identifier
                     token => {
-                        self.peeked = Some(token);
+                        self.peeked.push_front(token);
+                        for token in trivia.into_iter().rev() {
+                            self.peeked.push_front(Ok(token));
+                        }
                         return Ok(false);
                     }
                 };
@@ -226,7 +236,8 @@ impl MacroProcessor {
                 // Check for the number of arguments.
                 match parameters.len().cmp(&invocation.define.params.len()) {
                     Ordering::Greater => {
-                        let params_empty = parameters.len() == 1 && parameters[0].is_empty();
+                        let params_empty =
+                            parameters.len() == 1 && parameters[0].iter().all(|token| token.trivia);
                         let expects_zero_args = invocation.define.params.is_empty();
 
                         if !(params_empty && expects_zero_args) {
@@ -315,12 +326,10 @@ impl MacroProcessor {
                     paren_nesting -= 1;
                 }
 
-                TokenValue::Punct(Punct::Comma) => {
-                    // Commas outside of () split arguments and must not be added to them.
-                    if paren_nesting == 0 {
-                        arguments.push(Default::default());
-                        continue;
-                    }
+                // Commas outside of () split arguments and must not be added to them.
+                TokenValue::Punct(Punct::Comma) if paren_nesting == 0 => {
+                    arguments.push(Default::default());
+                    continue;
                 }
 
                 _ => {}
@@ -409,7 +418,7 @@ impl MacroProcessor {
     }
 
     fn step_internal(&mut self, lexer: &mut dyn MeLexer) -> Step<Token> {
-        if let Some(step) = self.peeked.take() {
+        if let Some(step) = self.peeked.pop_front() {
             return step;
         }
 
