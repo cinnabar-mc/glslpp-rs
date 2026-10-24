@@ -1,4 +1,3 @@
-use crate::lexer::Lexer;
 use crate::token::{Location, Token as PublicToken, TokenValue};
 
 /// One preprocessed text fragment at its original invocation line.
@@ -21,6 +20,8 @@ pub(crate) struct SourceToken {
     pub space: bool,
     pub trivia: bool,
     pub opaque: bool,
+    /// True when spelling is generated or copied into a macro expansion.
+    pub synthesized: bool,
     pub output_location: Location,
 }
 
@@ -34,6 +35,7 @@ impl SourceToken {
             space: false,
             trivia: false,
             opaque: false,
+            synthesized: true,
             output_location: location,
         }
     }
@@ -50,21 +52,27 @@ impl SourceToken {
 /// Retains token boundaries when writing expanded text.
 #[derive(Default)]
 pub(crate) struct Output {
-    previous: Option<String>,
+    previous_end: Option<u32>,
+    has_previous: bool,
 }
 
 impl Output {
-    /// Emits original trivia and adds spacing only where expansion requires it.
+    /// Copies contiguous source text and separates every synthesized boundary.
     pub(crate) fn render(&mut self, token: SourceToken) -> TextToken {
-        let separated = self
-            .previous
-            .as_ref()
-            .is_some_and(|previous| token.space || joins_tokens(previous, &token.text));
-        self.previous = if token.trivia || token.text.is_empty() {
-            None
-        } else {
-            Some(token.text.clone())
-        };
+        let separated = self.has_previous
+            && !token.text.is_empty()
+            && !token.text.starts_with(char::is_whitespace)
+            && (token.space
+                || token.synthesized
+                || self.previous_end != Some(token.location.start));
+        if !token.text.is_empty() {
+            self.has_previous = !token.trivia;
+            self.previous_end = if token.synthesized {
+                None
+            } else {
+                Some(token.location.end)
+            };
+        }
         TextToken {
             text: if separated {
                 format!(" {}", token.text)
@@ -79,17 +87,5 @@ impl Output {
                 Some(token.value)
             },
         }
-    }
-}
-
-/// Reports whether a token or comment would cross the fragment boundary.
-fn joins_tokens(left: &str, right: &str) -> bool {
-    let text = format!("{}{}", left, right);
-    let mut lexer = Lexer::new(&text);
-    lexer.set_preserve_text(true);
-    match lexer.next() {
-        Some(Ok(token)) => token.location.end as usize > left.len(),
-        Some(Err(_)) => true,
-        None => false,
     }
 }

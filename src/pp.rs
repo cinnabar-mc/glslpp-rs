@@ -39,6 +39,7 @@ impl DefineInvocation {
     /// Applies invocation spacing and source lines to a replacement token.
     fn output_token(&mut self, mut token: Token) -> Token {
         token.output_location = self.location;
+        token.synthesized = true;
         if self.first {
             token.space = self.space;
             self.first = false;
@@ -138,6 +139,7 @@ pub(crate) fn convert_lexer_token(
         space: token.leading_whitespace,
         trivia,
         opaque,
+        synthesized: false,
     })
 }
 

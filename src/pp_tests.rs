@@ -27,6 +27,33 @@ fn preprocessed_values(source: &str) -> Vec<TokenValue> {
         .collect()
 }
 
+/// Checks preserved values and strictly lexed output against ordinary preprocessing.
+fn assert_preserved_tokens(source: &str) {
+    let expected = preprocessed_values(source);
+    let rendered_values: Vec<_> = expected
+        .iter()
+        .filter(|value| {
+            !matches!(
+                value,
+                TokenValue::Version(_) | TokenValue::Extension(_) | TokenValue::Pragma(_)
+            )
+        })
+        .cloned()
+        .collect();
+    for glsl in [false, true] {
+        let (text, values) = preserved_output(source, glsl);
+        assert_eq!(values, expected, "{}", source);
+        let lexed_values: Vec<_> = NoopPreprocessor::new(&text)
+            .map(|token| {
+                token
+                    .unwrap_or_else(|error| panic!("strict lexer: {:?}, output: {:?}", error, text))
+                    .value
+            })
+            .collect();
+        assert_eq!(lexed_values, rendered_values, "{}", text);
+    }
+}
+
 #[test]
 fn preserved_macro_invocations_ignore_trivia() {
     let source = "#define F(x) x\n#define Z() 7\nF (1) F/*gap*/(2) F\n(3) Z( ) Z(/*empty*/)\nF /* keep */ + 4;\nF /* trailing */";
@@ -67,13 +94,11 @@ fn preserved_output_separates_comment_and_token_boundaries() {
         "#define NAME() foo\nNAME()bar;",
         "#define NUM() 1\nNUM().0;",
         "#define NUM() 1\nNUM()e;",
+        "#define N() 1\nN()L; N()l; N()S; N()s;",
+        "#define N() 1.0\nN()L; N()l; N()H; N()h;",
+        "#define VOID()\n/VOID()*2; /VOID()/2; +VOID()+2; 1VOID()L;",
     ] {
-        let expected = preprocessed_values(source);
-        for glsl in [false, true] {
-            let (text, values) = preserved_output(source, glsl);
-            assert_eq!(values, expected, "{}", source);
-            assert_eq!(preprocessed_values(&text), expected, "{}", text);
-        }
+        assert_preserved_tokens(source);
     }
 }
 
@@ -92,21 +117,52 @@ fn preservation_modes_have_identical_preprocessing_results() {
         "#if 0\n#error It's skipped\n@ 'bad\n#else\n7\n#endif\n",
         "#define FEATURE 0\n#if defined FEATURE && defined(FEATURE) && !defined MISSING\n7\n#endif\n",
     ] {
-        let expected = preprocessed_values(source);
-        for glsl in [false, true] {
-            let (text, values) = preserved_output(source, glsl);
-            assert_eq!(values, expected, "{}", source);
-            let rendered_values: Vec<_> = expected
-                .iter()
-                .filter(|value| {
-                    !matches!(
-                        value,
-                        TokenValue::Version(_) | TokenValue::Extension(_) | TokenValue::Pragma(_)
-                    )
-                })
-                .cloned()
-                .collect();
-            assert_eq!(preprocessed_values(&text), rendered_values, "{}", text);
+        assert_preserved_tokens(source);
+    }
+}
+
+#[test]
+fn preserved_adjacent_token_pairs_match_strict_lexing() {
+    let tokens = [
+        "0", "1", "1u", "0x1", "0.5", ".5", "1e2", "x", "L", "l", "S", "s", "H", "h", "e", "u",
+        "f", "+", "-", "/", "*", ".", "<", ">", "=", "!", "&", "|", "^", "%", "(", ")", "[", "]",
+        ";", ":", ",", "?", "~", "++", "--", ">>", "<<", "&&", "||", "==", "!=",
+    ];
+    for left in tokens {
+        for right in tokens {
+            for body in [
+                "LEFT()RIGHT()".to_owned(),
+                format!("LEFT(){}", right),
+                format!("{} RIGHT()", left),
+                format!("{}RIGHT()", left),
+            ] {
+                let source = format!(
+                    "#define LEFT() {}\n#define RIGHT() {}\n{}\n",
+                    left, right, body
+                );
+                assert_preserved_tokens(&source);
+            }
+        }
+        for comment in ["/* gap */", "// gap\n"] {
+            let source = format!("#define LEFT() {}\nLEFT(){}2;", left, comment);
+            assert_preserved_tokens(&source);
+        }
+    }
+}
+
+#[test]
+fn preserved_spacing_keeps_source_and_separates_expansions() {
+    for glsl in [false, true] {
+        for (source, expected) in [
+            ("foo[1]+=2;/*keep*/bar++;\n", "foo[1]+=2;/*keep*/bar++;\n"),
+            ("#define ADD(x) x+1\nfoo=ADD(2);\n", "foo= 2 + 1 ;\n"),
+            ("#define F(x) x\nF(1+2);\n", "1 + 2 ;\n"),
+            ("#define N() 1\nN()\t/*keep*/L;\n", "1\t/*keep*/L;\n"),
+            ("#define N() 1\nN()/**/L;\n", "1 /**/L;\n"),
+            ("#define VOID()\n+VOID()+;\n", "+ +;\n"),
+            ("line=__LINE__;\n", "line= 1 ;\n"),
+        ] {
+            assert_eq!(preserved_output(source, glsl).0, expected, "{}", source);
         }
     }
 }
@@ -139,19 +195,19 @@ fn preserved_properties_quotes_end_at_newlines() {
     for (source, expected) in [
         (
             "#define FEATURE 7\nvalue=\"first\\\nFEATURE // comment\nnext=FEATURE\n",
-            "value=\"first\\\n7 // comment\nnext=7\n",
+            "value=\"first\\\n7 // comment\nnext= 7\n",
         ),
         (
             "#define FEATURE 7\nvalue='first\\\nFEATURE /* comment */\nnext=FEATURE\n",
-            "value='first\\\n7 /* comment */\nnext=7\n",
+            "value='first\\\n7 /* comment */\nnext= 7\n",
         ),
         (
             "#define FEATURE 7\nvalue=\"FEATURE /* literal */\"\nnext=FEATURE\n",
-            "value=\"FEATURE /* literal */\"\nnext=7\n",
+            "value=\"FEATURE /* literal */\"\nnext= 7\n",
         ),
         (
             "#define FEATURE 7\nvalue=\"one\"\"two\"FEATURE\n",
-            "value=\"one\"\"two\"7\n",
+            "value=\"one\"\"two\" 7\n",
         ),
         ("value=\"unclosed", "value=\"unclosed\n"),
         ("value='unclosed", "value='unclosed\n"),
@@ -193,7 +249,7 @@ fn text_output_preserves_literals_comments_and_macro_boundaries() {
     }
     assert_eq!(
         output,
-        "value=-1 \\\n\"NEG\" /* NEG\n#if 0\n*/\nafter=0.50\n"
+        "value= - 1 \\\n\"NEG\" /* NEG\n#if 0\n*/\nafter=0.50\n"
     );
 }
 
@@ -1735,7 +1791,7 @@ fn text_macros_keep_invocation_lines_and_property_spelling() {
     let mut output = String::new();
     while let Some(token) = pp.next_text() {
         let token = token.unwrap();
-        if token.text == "0x10" || token.text == "2" || token.text == "5" {
+        if matches!(token.text.trim(), "0x10" | "2" | "5") {
             lines.push(token.line);
         }
         output.push_str(&token.text);
@@ -1743,7 +1799,7 @@ fn text_macros_keep_invocation_lines_and_property_spelling() {
     assert_eq!(lines, [1, 3, 5]);
     assert_eq!(
         output,
-        "entry=0x10\ncalc=2+1\nline=5\nliteral=\"https://host/*literal*/\" \\u0041\n"
+        "entry= 0x10\ncalc= 2 + 1\nline= 5\nliteral=\"https://host/*literal*/\" \\u0041\n"
     );
 }
 
